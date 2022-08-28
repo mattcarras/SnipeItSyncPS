@@ -34,6 +34,9 @@ All API calls will be retried up to 3 times by default if the following status c
 ### Logging
 To log messages for each user or asset synced, it's recommended to use the `-Verbose` switch with every `Sync-` and `Remove-` command.
 
+### String Decoding & Trimming
+All strings are run through `HTMLDecode` before comparion, since most (if not all) will be returned by the API encoded. All names and other supposedly unique values (such as username, asset_tag, etc.) are also trimmed. The `-Trim` parameter may be given to `Sync-SnipeItUser` and `Sync-SnipeItAsset` to trim ALL strings.
+
 ### Filtering by name and creating new Snipe-It entities if not found
 Snipe-It "Entities" (aka "objects") like "departments", "companies", etc. (basically anything with an ID) will be created automatically if given the right parameters. For most objects this is just the name, but some require more information, such as Categories, Models, Users, and Assets.
 
@@ -77,4 +80,4 @@ These functions are mainly used internally.
 - `Get-SnipeItUserEx`
 
 ## Reporting bugs and issues
- Please use both `-Verbose` and `-Debug` flags and include the information in your ticket (feel free to redact any identifable information). You may use `$DebugPreference='Continue'` at the top of your script to avoid breaking on each Write-Debug call.
+ Please use both `-Verbose` and `-Debug` switches with your function calls and include the information in your ticket (feel free to redact any identifable information). You may use `$DebugPreference='Continue'` at the top of your script to avoid breaking on each `Write-Debug` call.
