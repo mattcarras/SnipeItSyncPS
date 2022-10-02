@@ -254,6 +254,9 @@ function Get-SnipeItEntityAll {
         .PARAMETER UsersKey
         The key to check for dupes when returning all "users". This is also the key which is run through HtmlDecode and trimmed in advance.
 
+        .PARAMETER ExcludeArchivedAssets
+        For assets, exclude archived status type from results.
+
         .PARAMETER MaxCacheMin
         Number of Minutes from the cached entity's last update to get a fresh copy from the Snipe-It instance. If this is not given, it defaults to the last value set. If no value was ever given, it defaults to 120 minutes (2 hours). A value of 0 will always get a fresh copy each time, through the -NoCache switch can also be given to most parameters.
         
@@ -285,6 +288,9 @@ function Get-SnipeItEntityAll {
         [parameter(Mandatory=$false)]
         [ValidateSet("username","employee_num")]
         [string]$UsersKey="username",
+
+        [parameter(Mandatory=$false)]
+        [switch]$ExcludeArchivedAssets,
         
         [parameter(Mandatory=$false)]
         [ValidateRange(0,[int]::MaxValue)]
@@ -311,74 +317,107 @@ function Get-SnipeItEntityAll {
     }
     
     $cache_key = "sp_${EntityType}"
+    $getFunc = $null
     switch($EntityType) {
         "departments" {
-            $func = "Get-SnipeItDepartment"
-            $GetParams = @{ All = $true }
+            $getFunc = "Get-SnipeitDepartment"
+            $getParams = @{ All = $true }
         }
         "locations" {
-            $func = "Get-SnipeItLocation"
-            $GetParams = @{ All = $true }
+            $getFunc = "Get-SnipeitLocation"
+            $getParams = @{ All = $true }
         }
         "companies" {
-            $func = "Get-SnipeItCompany"
-            $GetParams = @{ All = $true }
+            $getFunc = "Get-SnipeitCompany"
+            $getParams = @{ All = $true }
         }
         "models" {
-            $func = "Get-SnipeItModel"
-            $GetParams = @{ All = $true }
+            $getFunc = "Get-SnipeitModel"
+            $getParams = @{ All = $true }
         }
         "manufacturers" {
-            $func = "Get-SnipeItManufacturer"
-            $GetParams = @{ All = $true }
+            $getFunc = "Get-SnipeitManufacturer"
+            $getParams = @{ All = $true }
         }
         "categories" {
-            $func = "Get-SnipeItCategory"
-            $GetParams = @{ All = $true }
+            $getFunc = "Get-SnipeitCategory"
+            $getParams = @{ All = $true }
         }
         "fieldsets" {
-            $func = "Get-SnipeItFieldset"
-            $GetParams = @{}
-        }
-        "statuslabels" {
-            $func = "Get-SnipeItStatus"
-            $GetParams = @{ All = $true }
-        }
-        "models" {
-            $func = "Get-SnipeItModel"
-            $GetParams = @{ All = $true }
-        }
-        "users" {
-            $func = "Get-SnipeItUser"
-            $GetParams = @{ All = $true }
-        }
-        "assets" {
-            $func = "Get-SnipeItAsset"
-            $GetParams = @{ All = $true }
+            $getFunc = "Get-SnipeitFieldset"
+            $getParams = @{}
         }
         "fields" {
-            $func = "Get-SnipeItCustomField"
-            $GetParams = @{}
+            $getFunc = "Get-SnipeitCustomField"
+            $getParams = @{}
+        }
+        "statuslabels" {
+            $getFunc = "Get-SnipeitStatus"
+            $getParams = @{ All = $true }
+        }
+        "models" {
+            $getFunc = "Get-SnipeitModel"
+            $getParams = @{ All = $true }
+        }
+        "users" {
+            $getFunc = "Get-SnipeitUser"
+            $getParams = @{ All = $true }
+        }
+        "assets" {
+            $getFunc = "Get-SnipeitAsset"
+            $getParams = @{ All = $true }
+        }
+        "suppliers" {
+            $getFunc = "Get-SnipeitSupplier"
+            $getParams = @{ All = $true }
         }
         default {
             # Should never get here
-            Throw [System.Management.Automation.ValidationMetadataException] "[Get-SnipeItEntityAll] Unsupported EntityType: $EntityType"
+            Throw [System.Management.Automation.ValidationMetadataException] "[Get-SnipeItEntityAll] Unsupported EntityType: $EntityType (should never get here?)"
         }
     }
     $sp_entities = $null
     if ($script:_SnipeItCache.Count -gt 0) {
         $sp_entities = $script:_SnipeItCache.$cache_key
     }
-    # Refresh the cache if over $MaxCacheMin.
-    if ($sp_entities.ht.Count -eq 0 -Or $RefreshCache -Or $sp_entities.maxAgeDate -isnot [DateTime] -Or (Get-Date) -ge $sp_entities.maxAgeDate) {
+    # Refresh the cache if either including archived results or cache is older than MaxCacheMin.
+    if ($sp_entities.ht.Count -eq 0 -Or $RefreshCache -Or ($ExcludeArchivedAssets -ne $true -And $sp_entities.excludeArchived -ne $ExcludeArchivedAssets) -Or $sp_entities.maxAgeDate -isnot [DateTime] -Or (Get-Date) -ge $sp_entities.maxAgeDate) {
         Write-Verbose "[Get-SnipeItEntityAll] Collecting all existing [$EntityType] from Snipe-It..."
         # TODO: Suggest update to SnipeitPS suppress these warnings
-        $sp_entities = &$func @GetParams -WarningAction SilentlyContinue
+        $sp_entities = &$getFunc @getParams -WarningAction SilentlyContinue
         if (-Not [string]::IsNullOrWhitespace($sp_entities.StatusCode)) {
             Throw [System.Net.WebException] ("[Get-SnipeItEntityAll] Fatal ERROR fetching all current snipe-it [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $EntityType,$sp_entities.StatusCode,$sp_entities.StatusDescription)
         } else {
+            # If assets, include archived in results unless -ExcludeArchived is given.
+            if ($EntityType -eq 'assets' -And -Not $ExcludeArchivedAssets) {
+                $getParams = @{ 
+                    All = $true 
+                    status = 'Archived'
+                }
+                $sp_entities_archived = &$getFunc @getParams -WarningAction SilentlyContinue
+                if (-Not [string]::IsNullOrWhitespace($sp_entities_archived.StatusCode)) {
+                    Throw [System.Net.WebException] ("[Get-SnipeItEntityAll] Fatal ERROR fetching all archived snipe-it [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $EntityType,$sp_entities_archived.StatusCode,$sp_entities_archived.StatusDescription)
+                } else {
+                    # Merge results with rest of assets.
+                    if ($sp_entities_archived -ne $null) {
+                        if ($sp_entities -eq $null) {
+                            $sp_entities = $sp_entities_archived
+                        } else {
+                            if ($sp_entities_archived -isnot [array]) {
+                                $sp_entities_archived = @($sp_entities_archived)
+                            }
+                            if ($sp_entities -isnot [array]) {
+                                $sp_entities = @($sp_entities)
+                            }
+                            $sp_entities += $sp_entities_archived
+                        }
+                    }
+                }    
+            }
+
             # Decode HTMLEntity and trim results
             $sp_entities = $sp_entities | Select @{N=$primaryKey; Expression={([System.Net.WebUtility]::HtmlDecode($_.$primaryKey)).Trim()}},* -ExcludeProperty $primaryKey
+
             # Check and warn about dupes
             $sp_entities | where {[string]::IsNullOrEmpty($_.$primaryKey) -ne $true} | Group-Object -Property $primaryKey | where {$_.Count -gt 1} | foreach {
                 if ($ErrorOnDupe) {
@@ -387,7 +426,7 @@ function Get-SnipeItEntityAll {
                     Write-Warning ("[Get-SnipeItEntityAll] Found {0} non-unique [{1}] where [{2}]=[{3}]" -f $_.Count,$EntityType,$primaryKey,($_.Group.$primaryKey | Select -First 1))
                 }
             }
-            
+
             # Set maximum cache age
             $_maxCacheMin = $MaxCacheMin
             if ($MaxCacheMin -is [int]) {
@@ -404,6 +443,7 @@ function Get-SnipeItEntityAll {
                 ht = ($sp_entities | Group-Object -Property id -AsHashTable -AsString) 
                 maxCacheMin = $_maxCacheMin
                 maxAgeDate = (Get-Date).AddMinutes($_maxCacheMin)
+                excludeArchived = $ExcludeArchivedAssets
             }
             
             if ($script:_SnipeItCache.Count -gt 0) {
@@ -888,7 +928,7 @@ function Get-SnipeItEntityByName {
                 }
                 default {
                     # Should never get here
-                    Throw [System.Management.Automation.ValidationMetadataException] "[Get-SnipeItEntityByName] Unsupported EntityType: $EntityType"
+                    Throw [System.Management.Automation.ValidationMetadataException] "[Get-SnipeItEntityByName] Unsupported EntityType: $EntityType (should never get here?)"
                 }
             }
         }
@@ -2354,7 +2394,7 @@ function Get-SnipeItEntityByID {
             }
             default {
                 # Should never get here
-                Throw [System.Management.Automation.ValidationMetadataException] "[Get-SnipeItEntityByName] Unsupported EntityType: $EntityType"
+                Throw [System.Management.Automation.ValidationMetadataException] "[Get-SnipeItEntityByName] Unsupported EntityType: $EntityType (should never get here?)"
             }
         }
         try {
@@ -3774,6 +3814,9 @@ function Sync-SnipeItAsset {
         .PARAMETER DefaultCreateStatus
         Default status or status ID when creating assets. This must equate to a valid status. Defaults to 2.
         
+        .PARAMETER UpdateArchivedStatus
+        Change archived assets to the given status if found when syncing, otherwise display a warning.
+
         .PARAMETER DontCreateIfNotFound
         Don't create any assets if not found, only update existing assets.
         
@@ -3864,6 +3907,9 @@ function Sync-SnipeItAsset {
         [parameter(Mandatory=$false)]
         [string]$DefaultCreateStatus = "2",
         
+        [parameter(Mandatory=$false)]
+        [string]$UpdateArchivedStatus,
+
         [parameter(Mandatory=$false)]
         [switch]$DontCreateIfNotFound,
 
@@ -4472,6 +4518,20 @@ function Sync-SnipeItAsset {
             if ($status_id -is [int] -And $sp_asset.status_label.id -ne $status_id) {
                 $updateParams.Add("status_id", $status_id)
                 $fieldsToUpdate += @("status_id")
+            } elseif ($sp_asset.status_label.status_type -eq 'archived') {
+                # For archived assets, check if $UpdateArchivedStatus is set
+                if (-Not [string]::IsNullOrWhitespace($UpdateArchivedStatus)) { 
+                    $status_id = ($UpdateArchivedStatus -as [int])
+                    if ($status_id -isnot [int]) {
+                        $status_id = (Get-SnipeItStatusLabelByName $UpdateArchivedStatus @passParams).id
+                        if ($status_id -isnot [int]) {
+                            Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Invalid status given to -UpdateArchivedStatus [{0}]" -f $UpdateArchivedStatus)
+                        } elseif ($sp_asset.status_label.id -ne $status_id) {
+                            $updateParams.Add("status_id", $status_id)
+                            $fieldsToUpdate += @("status_id")
+                        }
+                    }
+                }
             }
             # Do we have need to update the model ID?
             # Only update when not using the default model.
@@ -4497,6 +4557,10 @@ function Sync-SnipeItAsset {
             if ($updateParams.Count -le 0) {
                 Write-Verbose ("[Sync-SnipeItAsset] [$UniqueID] Nothing to update for snipe-it asset ID [{0}] (matched by: {1})" -f $sp_asset.id, $matchfield)
             } else {
+                # Give a warning if we're updating archived assets.
+                if ($sp_asset.status_label.status_type -eq 'archived' -And -Not $updateParams.ContainsKey('status_id')) {
+                    Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Updating archived asset ID [{0}] without updating status" -f $sp_asset.id)
+                }
                 if (-Not $DebugOutputCreateOnly) {
                     Write-Debug("[Sync-SnipeItAsset] [$UniqueID] Updating snipe-it asset ID [{0}] with parameters: {1}" -f $sp_asset.id,($updateParams | ConvertTo-Json -Depth 10))
                 }
@@ -4522,6 +4586,11 @@ function Sync-SnipeItAsset {
                                 Write-Verbose ("[Sync-SnipeItAsset] [$UniqueID] Updated snipe-it asset ID [{0}] (matched by: {1}) for fields: {2}" -f $sp_asset.id,$matchfield,($fieldsToUpdate -join ", "))
                             }
                             $update_cache = $true
+                            # Refetch asset from server due to https://github.com/snipe/snipe-it/issues/11725
+                            $sp_asset_refetched = Get-SnipeItEntityByID $sp_asset.id "assets" -NoCache
+                            if ([string]::IsNullOrWhitespace($sp_asset_refetched.StatusCode) -And $sp_asset_refetched.id -is [int]) {
+                                $sp_asset = $sp_asset_refetched
+                            }
                         }
                         # Break out of loop early on anything except "Too Many Requests"
                         $count_retry = -1
@@ -4693,4 +4762,134 @@ function Format-SnipeItAsset {
     }
 }
 
+function Remove-SnipeItInactiveEntity {
+    <#
+        .SYNOPSIS
+        Removes all unassigned snipe-it entities of the given type(s).
+        
+        .DESCRIPTION
+        Removes all unassigned snipe-it entities of the given type(s).
+        
+        .PARAMETER EntityTypes
+        Required. One or more of the types of entities supported by the Snipe-It API. This is always in the form of their API name (IE, "departments").
+        
+        .PARAMETER ExcludeNames
+        Exclude the given names (exact match).
+        
+        .PARAMETER ExcludeNamePattern
+        Exclude names matching the given pattern.
+        
+        .PARAMETER OnErrorRetry
+        The number of times to retry if we get certain error codes like "Too Many Requests" (default: 3). Give 0 to never retry.
 
+        .PARAMETER SleepMS
+        The number of milliseconds to sleep after each API call (default: 1000ms).
+        
+        .OUTPUTS
+        None.
+        
+        .Example
+        PS> Remove-SnipeItInactiveEntity "departments","companies","locations"
+    #>
+    param (
+        [parameter(Mandatory=$true,
+                   Position=0)]
+        [ValidateSet("departments","locations","companies","manufacturers","categories","models","fields","suppliers")]
+        [string[]]$EntityTypes,
+        
+        [parameter(Mandatory=$false)]
+        [string[]]$ExcludeNames,
+        
+        [parameter(Mandatory=$false)]
+        [string]$ExcludeNamePattern,
+        
+        [parameter(Mandatory=$false)]
+        [switch]$RefreshCache,
+        
+        [parameter(Mandatory=$false)]
+        [ValidateRange(0,[int]::MaxValue)]
+        [int]$OnErrorRetry=3,
+        
+        [parameter(Mandatory=$false)]
+        [ValidateRange(0,[int]::MaxValue)]
+        [int]$SleepMS=1000
+    )
+    
+    $passParams = @{}
+    foreach ($param in @("RefreshCache","Debug","Verbose")) {
+        if ($PSBoundParameters[$param]) {
+            $passParams[$param] = $true
+        }
+    }
+            
+    Write-Debug("[Remove-SnipeItInactiveEntity] ExcludeNames: [{0}], ExcludeNamePattern: [{1}]" -f ($ExcludeNames -join ', '), $ExcludeNamePattern)
+    foreach ($entityType in $EntityTypes) {
+        $removeFunc = $null
+        switch($entityType) {
+            "departments" {
+                $removeFunc = "Remove-SnipeitDepartment"
+            }
+            "locations" {
+                $removeFunc = "Remove-SnipeitLocation"
+            }
+            "companies" {
+                $removeFunc = "Remove-SnipeitCompany"
+            }
+            "manufacturers" {
+                $removeFunc = "Remove-SnipeitManufacturer"
+            }
+            "categories" {
+                $removeFunc = "Remove-SnipeitCategory"
+            }
+            "models" {
+                $removeFunc = "Remove-SnipeitModel"
+            }
+            "fields" {
+                $removeFunc = "Remove-SnipeitCustomField"
+            }
+            "suppliers" {
+                $removeFunc = "Remove-SnipeitSupplier"
+            }
+            default {
+                Throw [System.Management.Automation.ValidationMetadataException] "[Remove-SnipeItInactiveEntity] Unsupported EntityType: $entityType (should never get here?)"
+            }
+        }
+        $sp_entities = (Get-SnipeItEntityAll $entityType @passParams).Values 
+        if ($sp_entities.id.Count -gt 0) {
+            $deletable_entities = $sp_entities | where {$_.available_actions.delete -eq $true -And ([string]::IsNullOrEmpty($_.name) -Or (([string]::IsNullOrEmpty($ExcludeNames) -Or $ExcludeNames -notcontains $_.name) -And ([string]::IsNullOrEmpty($ExcludeNamePattern) -Or $_name -notmatch $ExcludeNamePattern)))}
+            if ($deletable_entities.id.Count -eq 0) {
+                Write-Verbose("[Remove-SnipeItInactiveEntity] No matching inactive entities found for [$entityType]")
+            } elseif (-Not [string]::IsNullOrEmpty($removeFunc)) {
+                Write-Verbose("[Remove-SnipeItInactiveEntity] Found [{0}] matching deletable inactive [{1}] in snipe-it, removing..." -f $deletable_entities.id.Count, $entityType)
+                foreach ($entity in $deletable_entities) {
+                    if ($entity.id -is [int]) {
+                        $count_retry = $OnErrorRetry
+                        while ($count_retry -ge 0) {
+                            # TODO: Suggest update to SnipeitPS suppress these warnings
+                            $result = &$removeFunc -id $entity.id -WarningAction SilentlyContinue
+                            if (-Not [string]::IsNullOrWhitespace($result.StatusCode) -And $result.StatusCode -in $SNIPEIT_RETRY_ON_STATUS_CODES) {
+                                $count_retry--
+                                Write-Warning ("[Remove-SnipeItInactiveEntity] ERROR removing snipeit inactive [{0}] with name [{1}], id {2}! StatusCode: {3}, StatusDescription: {4}, Retries Left: {5}" -f $entityType,$entity.name,$entity.id,$result.StatusCode,$result.StatusDescription,$count_retry)
+                            } else {
+                                if ([string]::IsNullOrWhitespace($result.StatusCode) -Or $result.StatusCode -eq 200 -Or $result.StatusCode -eq 'OK') {
+                                    Write-Verbose ("[Remove-SnipeItInactiveEntity] Removed inactive [{0}] from snipe-it with name [{1}], id {2}" -f $entityType,$entity.name,$entity.id)
+                                    $update_cache = $true
+                                }
+                                # Break out of loop early on anything except "Too Many Requests"
+                                $count_retry = -1
+                            }
+                            # Sleep before next API call
+                            Start-Sleep -Milliseconds $SleepMS
+                        }
+                        # Throw exception on consistent errors
+                        if (-Not $update_cache) {
+                            Throw [System.Net.WebException] ("[Remove-SnipeItInactiveEntity] Fatal ERROR removing inactive [{0}] from snipe-it where name=[{1}] and id={2}! StatusCode: {3}, StatusDescription: {4}" -f $entityType,$entity.name,$entity.id,$result.StatusCode,$result.StatusDescription)
+                        } else {
+                            $success = Update-SnipeItCache $entity.id $entityType -Remove
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
