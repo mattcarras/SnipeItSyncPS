@@ -66,6 +66,8 @@ $ASSET_FIELD_SYNC_ON_MAP = [ordered]@{
 $ASSET_FIELD_CREATE_REQUIRED = @("Name","Serial","SMBIOS GUID","Model","Manufacturer","Category")
 # Status used when creating. This can be the status name or ID. This must be a valid status.
 $ASSET_CREATE_STATUS = "Pending"
+# Optional status used to change archived assets to when encountered in sync. This can be the status name or ID.
+# $ASSET_ARCHIVED_STATUS_CHANGE_TO = "New"
 # Default model name used when no model is found. This only accepts model names.
 # If given, this model must already be created in Snipe-It.
 $ASSET_DEFAULT_MODEL = "_Unknown PC Model_"
@@ -92,8 +94,8 @@ $EXPORTS_ROTATE_DAYS = 365
 <#
 $EMAIL_SMTP = '<smtp server>'
 # If filled out, send error reports
-$EMAIL_FROM_ERROR_REPORT = '<from address>'
-$EMAIL_TO_ERROR_REPORT = '<to address>'
+$EMAIL_ERROR_REPORT_FROM = '<from address>'
+$EMAIL_ERROR_REPORT_TO = '<to address>'
 #>
 # -- END CONFIGURATION --
 
@@ -622,7 +624,7 @@ If ($DEBUG_HALT_ON_NULL_CACHE) {
 Initialize-SnipeItCache -EntityTypes $cacheentities -Verbose @extraParams
 
 # Filter out those that don't exist in SCCM and VMs, and format for syncing
-$formatted_assets = $joined_assets | where {$_."Exists In SCCM" -eq $true -And -Not $_.IsVirtualMachine} | Format-AssetForSyncing -PropertyMap $ASSET_FIELD_MAP
+$formatted_assets = $joined_assets | where {$_."Exists in SCCM" -eq $true -And -Not $_.IsVirtualMachine} | Format-AssetForSyncing -PropertyMap $ASSET_FIELD_MAP
 
 # Export all formatted assets
 if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container)) {
@@ -644,12 +646,14 @@ $error_count = 0
 if (-Not $ENABLE_SYNC) {
     Write-Host('Please set $ENABLE_SYNC to $true when ready to start syncing.')
     Write-Debug('Debug breakpoint due to $ENABLE_SYNC not set.')
-}
 } else {
     Write-Host("[{0}] Starting sync..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"))
     $extraParams = @{}
     if (-Not [string]::IsNullOrWhitespace($ASSET_DEFAULT_MODEL)) {
         $extraParams.Add("DefaultModel", $ASSET_DEFAULT_MODEL)
+    }
+    if (-Not [string]::IsNullOrWhitespace($ASSET_ARCHIVED_STATUS_CHANGE_TO)) {
+        $extraParams.Add('UpdateArchivedStatus', $ASSET_ARCHIVED_STATUS_CHANGE_TO)
     }
     foreach ($asset in $formatted_assets) {
         try {
@@ -670,17 +674,34 @@ if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container
     }
     try {
         Write-Host("[{0}] Exporting assets from snipe-it to CSV file [{1}]..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"), $fp)
-        $sp_assets | Format-SnipeItAsset -AddDepartment | Export-CSV -NoTypeInformation $fp
+        $formatted_assets = $sp_assets | Format-SnipeItAsset -AddDepartment
+        # Ensure we have all possible custom fields in output
+        # initial_props are always ordered first, the other columns are semi-sorted
+        $initial_props = @('asset_tag','name','serial','status_label','assigned_to','Department','manufacturer','model','category')
+        $props = $formatted_assets | % { Get-Member -MemberType NoteProperty -InputObject $_ | Select -ExpandProperty Name } | Select -Unique | where {$_ -notin $initial_props}
+        if ($props -is [array]) {
+            $props = $initial_props + $props
+        } elseif ($props -is [string]) {
+            $props = $initial_props + @($props)
+        } else {
+            # Should never get here
+            $props = $initial_props
+        }
+
+        $formatted_assets | Select $props | Export-CSV -NoTypeInformation $fp
     } catch {
         Write-Error $_
+        $error_count++
     }
 }
-# Stop logging, in case you're running from console.
-Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 
 # Email out notifications of any errors.
 if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP)) {
-    if ($error_count -gt 0 -And -Not [string]::IsNullOrWhiteSpace($EMAIL_FROM_ERROR_REPORT) -And -Not [string]::IsNullOrWhiteSpace($EMAIL_TO_ERROR_REPORT)) {
-        Send-MailMessage -From $EMAIL_FROM_ERROR_REPORT -To $EMAIL_TO_ERROR_REPORT -Subject 'Errors from Snipeit-Asset-Sync' -Body "There were [$error_count] caught errors from Snipeit-Asset-Sync.ps1 running on [${ENV:COMPUTERNAME}]. See [$_logfilepath] for more details." -Priority High -DeliveryNotificationOption OnSuccess, OnFailure -SmtpServer $EMAIL_SMTP
+    if ($error_count -gt 0 -And -Not [string]::IsNullOrWhiteSpace($EMAIL_ERROR_REPORT_FROM) -And ($EMAIL_ERROR_REPORT_TO -is [string] -Or ($EMAIL_ERROR_REPORT_TO -is [array] -And $EMAIL_ERROR_REPORT_TO.Count -gt 0))) {
+        Send-MailMessage -From $EMAIL_ERROR_REPORT_FROM -To $EMAIL_ERROR_REPORT_TO -Subject 'Errors from Snipeit-Asset-Sync' -Body "There were [$error_count] caught errors from Snipeit-Asset-Sync.ps1 running on [${ENV:COMPUTERNAME}]. See [$_logfilepath] for more details." -Priority High -DeliveryNotificationOption OnSuccess, OnFailure -SmtpServer $EMAIL_SMTP
+        Write-Host("[{0}] Emailed error report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($EMAIL_ERROR_REPORT_TO -join ", "))
     }
 }
+
+# Stop logging, in case you're running from console.
+Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
