@@ -12,12 +12,17 @@
 # Author: Matthew Carras
 # Source: https://github.com/mattcarras/SnipeItSyncPS
 
+# Parameter definitions.
+# Given parameters override configuration below.
+param([switch] $DisableSync, [switch] $ADSyncDeletedUsersPurge, [switch] $EmailDeletedUsersReport)
+
 # -- START CONFIGURATION --
 # Previously exported credentials from Export-SnipeItCredentials
 $CREDXML_PATH = "your_exported_credentials.xml"
 
 # This must evaluate to $true to actually start syncing. Otherwise the script skips syncing entirely.
 # It also gives a debug breakpoint, if you have debugging enabled.
+# Note the -DisableSync switch overrides this setting.
 $ENABLE_SYNC = $false
 
 # Target group(s) of users to sync with Snipe-It.
@@ -60,12 +65,20 @@ $AD_SYNC_ON_EMPLOYEE_NUM = $true
 $AD_SYNC_EMAIL_FOR_LOGIN_ONLY = $true
 
 # Purge users that no longer exist in the target AD groups.
-# It's recommended to have either $AD_SYNC_ON_EMPLOYEE_NUM set to $true or set all your groups with ldap_import=$true.
+# You must have either $AD_SYNC_ON_EMPLOYEE_NUM set to $true or set all your groups with ldap_import=$true.
+# Note the -ADSyncDeletedUsersPurge switch overrides this setting.
 $AD_SYNC_PURGE_DELETED_USERS = $false
 
-# Flag deleted users by removing ldap_import (if set) and disabling login.
-# This will be done if they are NOT purged.
-$AD_SYNC_FLAG_DELETED_USERS = $false
+# Only report on deleted users, do not flag or purge.
+# Note the -ADSyncDeletedUsersPurge switch overrides this setting.
+$AD_SYNC_DELETED_USERS_REPORT_ONLY = $false
+
+# Skip processing deleted users entirely.
+# Note the -ADSyncDeletedUsersPurge switch overrides this setting.
+$AD_SYNC_DELETED_USERS_SKIP = $false
+
+# Path to save latest deleted users report
+# $AD_SYNC_EXPORT_DELETED_USERS_PATH = "path\to\deleted_users_report.csv"
 
 # Create special users for each department to allow assigning assets to departments.
 $AD_SYNC_DEPARTMENT_USERS = $true
@@ -85,8 +98,20 @@ $LOGFILE_ROTATE_DAYS = 365
 <#
 $EMAIL_SMTP = '<smtp server>'
 # If filled out, send error reports
-$EMAIL_FROM_ERROR_REPORT = '<from address>'
-$EMAIL_TO_ERROR_REPORT = '<to address>'
+$EMAIL_ERROR_REPORT_FROM = '<from address>'
+# May include multiple destination addresses as an array.
+$EMAIL_ERROR_REPORT_TO = '<to address>'
+#>
+
+<#
+# You may also give the -EmailDeletedUsersReport script parameter.
+# Using this in combination with the -DisableSync and -ADSyncDeletedUsersPurge script parameters allows
+# for purging users and emailing out the results.
+$EMAIL_DELETED_USERS_REPORT = $false
+$EMAIL_DELETED_USERS_REPORT_FROM = '<from address>'
+# May include multiple destination addresses as an array.
+$EMAIL_DELETED_USERS_REPORT_TO = '<to address>'
+$EMAIL_DELETED_USERS_REPORT_SUBJECT = 'Weekly Inactive Snipe-It Users Report'
 #>
 # -- END CONFIGURATION --
 
@@ -369,9 +394,13 @@ if ($AD_SYNC_ON_EMPLOYEE_NUM) {
 }
 
 $error_count = 0
-if (-Not $ENABLE_SYNC) {
-    Write-Host('Please set $ENABLE_SYNC to $true when ready to start syncing.')
-    Write-Debug('Debug breakpoint due to $ENABLE_SYNC not set.')
+if (-Not $ENABLE_SYNC -Or $DisableSync) {
+    if (-Not $ENABLE_SYNC) {
+        Write-Host('Please set $ENABLE_SYNC to $true when ready to start syncing.')
+        Write-Debug('Debug breakpoint due to $ENABLE_SYNC not set.')
+    } else {
+        Write-Host('Not syncing due to given -DisableSync switch.')
+    }
 } else {
     Write-Host("[{0}] Starting sync..." -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")))
     foreach($user in $formatted_users) {
@@ -387,41 +416,98 @@ if (-Not $ENABLE_SYNC) {
     if ($AD_SYNC_DEPARTMENT_USERS) {
         Sync-SnipeItDeptUsers -SyncCompany -SkipEmptyDepartment -Verbose
     }
+}
 
-    # Flag users that no longer exist in targeted AD groups and delete them if they have 0 assignments of all types
-    if ($AD_SYNC_ON_EMPLOYEE_NUM -Or $AD_GROUP_TARGETS_FLAG_LDAP_IMPORT) {
+# Flag users that no longer exist in targeted AD groups and delete them if they have 0 assignments of all types
+# For safety either $AD_SYNC_ON_EMPLOYEE_NUM must be enabled or all target groups must have ldap_import enabled.
+# This ensures the special department and API users don't get flagged or purged.
+$inactive_users_undeletable = $null
+$inactive_users = $null
+$inactive_users_deletable_count = 0
+if ($formatted_users.Count -gt 0 -And -Not $AD_SYNC_DELETED_USERS_SKIP) {
+    $_all_ldap_import = ($AD_GROUP_TARGETS | where {$_.ldap_import -eq $true}).Count -eq $AD_GROUP_TARGETS.Count
+    if (-Not $AD_SYNC_ON_EMPLOYEE_NUM -And -Not $_all_ldap_import) {
+        Write-Host('[{0}] Skipping deleted users -- please either set AD_SYNC_ON_EMPLOYEE_NUM or make sure all target AD groups set to use ldap_import if needed' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")))
         $extraParams = @{}
         if ($AD_SYNC_ON_EMPLOYEE_NUM) {
             $extraParams.Add("CompareEmployeeNum", $true)
         }
-        if (($AD_GROUP_TARGETS | where {$_.ldap_import -eq $true}).Count -eq $AD_GROUP_TARGETS.Count) {
+        if ($_all_ldap_import) {
             $extraParams.Add("OnlyIfLdapImport", $true)
             if ($AD_SYNC_ON_EMPLOYEE_NUM) {
                 $extraParams.Add("AlsoCompareUsername", $true)
             }
         }
-        if (-Not $AD_SYNC_PURGE_DELETED_USERS) {
-            $extraParams.Add("DontDelete", $true)
+        if (-Not $ADSyncDeletedUsersPurge) {
+            if (-Not $AD_SYNC_DELETED_USERS_PURGE) {
+                $extraParams.Add("DontDelete", $true)
+            }
+            if ($AD_SYNC_DELETED_USERS_REPORT_ONLY) {
+                $extraParams.Add("OnlyReport", $true)
+            }
         }
-        if (-Not $AD_SYNC_FLAG_DELETED_USERS) {
-            $extraParams.Add("OnlyReport", $true)
-        }
-        $inactive_users = Remove-SnipeItInactiveUsers -CompareUsers $formatted_users @extraParams -Verbose
-        # DEBUG - need to send this in a report
+        $inactive_users = Remove-SnipeItInactiveUsers -CompareUsers $formatted_users -Verbose -Debug @extraParams 
+        
         if ($inactive_users.Count -gt 0) {
-            Write-Host("Inactive snipe-it users that no longer exist in AD: {0}" -f ($inactive_users.username -join ", "))
+            # Add department along with username, if it exists
+            $inactive_users_undeletable = $inactive_users | where {$_.available_actions.delete -eq $false} | Select @{N="_UsernameWithDept"; Expression={ if (-Not [string]::IsNullOrEmpty($_.department.name)) { ("{0} ({1})" -f $_.username, [System.Net.WebUtility]::HtmlDecode($_.department.name)) else { $_.username }}}} | Select -ExpandProperty _UsernameWithDept
+            $inactive_users_undeletable_count = $inactive_users_undeletable.Count
+            $inactive_users_undeletable = $inactive_users_undeletable -join ", "
+            $inactive_users_deletable = $inactive_users | where {$_.available_actions.delete -eq $true} | Select -ExpandProperty username
+            $inactive_users_deletable_count = $inactive_users_deletable.Count
+            $inactive_users_deletable = $inactive_users_deletable -join ", "
+            if (-Not [string]::IsNullOrEmpty($inactive_users_undeletable)) {
+                Write-Host('[{0}] Inactive snipe-it users that no longer exist in AD and CANNOT be deleted: {1}' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $inactive_users_undeletable)
+            }
+            if (-Not [string]::IsNullOrEmpty($inactive_users_deletable)) {
+                Write-Host('[{0}] Inactive snipe-it users that no longer exist in AD and can/have been deleted: {1}' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $inactive_users_deletable)
+            }
+            if (-Not [string]::IsNullOrWhiteSpace($AD_SYNC_EXPORT_DELETED_USERS_PATH)) {
+                $inactive_users | Select *,@{N="_DELETABLE_"; Expression={ $_.available_actions.delete -eq $true }} | Format-SnipeItEntity | Export-CSV -NoTypeInformation $AD_SYNC_EXPORT_DELETED_USERS_PATH
+                if (Test-Path $AD_SYNC_EXPORT_DELETED_USERS_PATH -PathType Leaf) {
+                    Write-Host('[{0}] Inactive user report has been saved to [{1}].' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $AD_SYNC_EXPORT_DELETED_USERS_PATH)
+                }
+            }
         }
     }
 }
 
 Write-Host("[{0}] Caught {1} errors" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $error_count)
 
-# Stop logging, in case you're running from console.
-Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
-
 # Email out notifications of any errors.
 if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP)) {
-    if ($error_count -gt 0 -And -Not [string]::IsNullOrWhiteSpace($EMAIL_FROM_ERROR_REPORT) -And -Not [string]::IsNullOrWhiteSpace($EMAIL_TO_ERROR_REPORT)) {
-        Send-MailMessage -From $EMAIL_FROM_ERROR_REPORT -To $EMAIL_TO_ERROR_REPORT -Subject 'Errors from Snipeit-AD-Sync' -Body "There were [$error_count] caught errors from Snipeit-AD-Sync.ps1 running on [${ENV:COMPUTERNAME}]. See [$_logfilepath] for more details." -Priority High -DeliveryNotificationOption OnSuccess, OnFailure -SmtpServer $EMAIL_SMTP
+     # Email out notifications of any errors.
+    if ($error_count -gt 0 -And -Not [string]::IsNullOrWhiteSpace($EMAIL_ERROR_REPORT_FROM) -And ($EMAIL_ERROR_REPORT_TO -is [string] -Or ($EMAIL_ERROR_REPORT_TO -is [array] -And $EMAIL_ERROR_REPORT_TO.Count -gt 0))) {
+        Send-MailMessage -From $EMAIL_ERROR_REPORT_FROM -To $EMAIL_ERROR_REPORT_TO -Subject 'Errors from Snipeit-AD-Sync' -Body "There were [$error_count] caught errors from Snipeit-AD-Sync.ps1 running on [${ENV:COMPUTERNAME}]. See [$_logfilepath] for more details." -Priority High -DeliveryNotificationOption OnSuccess, OnFailure -SmtpServer $EMAIL_SMTP
+        Write-Host("[{0}] Emailed error report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($EMAIL_ERROR_REPORT_TO -join ", "))
+    }
+    
+    # Email out a report on deleted users.
+    if ($EMAIL_DELETED_USERS_REPORT -Or $EmailDeletedUsersReport) {
+        if ([string]::IsNullOrWhiteSpace($EMAIL_DELETED_USERS_REPORT_FROM) -Or -Not ($EMAIL_DELETED_USERS_REPORT_TO -is [string] -Or ($EMAIL_DELETED_USERS_REPORT_TO -is [array] -And $EMAIL_DELETED_USERS_REPORT_TO.Count -gt 0)) -Or [string]::IsNullOrEmpty($EMAIL_DELETED_USERS_REPORT_SUBJECT)) {
+            Write-Error("Cannot email deleted users report -- invalid parameters (are EMAIL_DELETED_USERS_REPORT_FROM, EMAIL_DELETED_USERS_REPORT_TO, and EMAIL_DELETED_USERS_REPORT_SUBJECT set correctly?)")
+        } elseif (-Not [string]::IsNullOrEmpty($inactive_users_undeletable) -And $inactive_users -ne $null) {
+            $total_count = $inactive_users.Count
+            $datestamp = (Get-Date).toString("yyyy/MM/dd HH:mm:ss")
+            if ($AD_SYNC_DELETED_USERS_PURGE -And -Not $AD_SYNC_DELETED_USERS_REPORT_ONLY) {
+                $deletable_action = "have been removed"
+            } else {
+                $deletable_action = "can be removed"
+            }
+            $body = @"
+There are [$total_count] users in Snipe-It that no longer exist in target AD group(s), of which [$inactive_users_deletable_count] ${deletable_action}. A user must have all their assignments checked in before they can be deleted.
+
+Inactive snipe-it users which cannot be deleted: $inactive_users_undeletable
+
+A report has been saved to [$AD_SYNC_EXPORT_DELETED_USERS_PATH].
+
+This message generated on [$datestamp] from [Snipeit-AD-Sync.ps1] running on [${ENV:COMPUTERNAME}].
+"@
+            Send-MailMessage -From $EMAIL_DELETED_USERS_REPORT_FROM -To $EMAIL_DELETED_USERS_REPORT_TO -Subject $EMAIL_DELETED_USERS_REPORT_SUBJECT -Body $body -Priority High -DeliveryNotificationOption OnSuccess, OnFailure -SmtpServer $EMAIL_SMTP
+            Write-Host("[{0}] Emailed inactive user report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($EMAIL_DELETED_USERS_REPORT_TO -join ", "))
+        }
     }
 }
+
+# Stop logging, in case you're running from console.
+Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
