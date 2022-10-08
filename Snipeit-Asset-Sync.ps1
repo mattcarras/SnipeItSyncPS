@@ -95,6 +95,7 @@ $EXPORTS_ROTATE_DAYS = 365
 $EMAIL_SMTP = '<smtp server>'
 # If filled out, send error reports
 $EMAIL_ERROR_REPORT_FROM = '<from address>'
+# May include multiple destination addresses as an array.
 $EMAIL_ERROR_REPORT_TO = '<to address>'
 #>
 # -- END CONFIGURATION --
@@ -695,13 +696,27 @@ if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container
     }
 }
 
-# Email out notifications of any errors.
-if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP)) {
-    if ($error_count -gt 0 -And -Not [string]::IsNullOrWhiteSpace($EMAIL_ERROR_REPORT_FROM) -And ($EMAIL_ERROR_REPORT_TO -is [string] -Or ($EMAIL_ERROR_REPORT_TO -is [array] -And $EMAIL_ERROR_REPORT_TO.Count -gt 0))) {
-        Send-MailMessage -From $EMAIL_ERROR_REPORT_FROM -To $EMAIL_ERROR_REPORT_TO -Subject 'Errors from Snipeit-Asset-Sync' -Body "There were [$error_count] caught errors from Snipeit-Asset-Sync.ps1 running on [${ENV:COMPUTERNAME}]. See [$_logfilepath] for more details." -Priority High -DeliveryNotificationOption OnSuccess, OnFailure -SmtpServer $EMAIL_SMTP
-        Write-Host("[{0}] Emailed error report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($EMAIL_ERROR_REPORT_TO -join ", "))
-    }
-}
-
-# Stop logging, in case you're running from console.
+# Stop logging
 Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+
+# Email out notifications of any errors.
+if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP) -And ($error_count -gt 0 -And -Not [string]::IsNullOrWhiteSpace($EMAIL_ERROR_REPORT_FROM) -And ($EMAIL_ERROR_REPORT_TO -is [string] -Or ($EMAIL_ERROR_REPORT_TO -is [array] -And $EMAIL_ERROR_REPORT_TO.Count -gt 0)))) {
+    $params = @{
+        From = $EMAIL_ERROR_REPORT_FROM
+        To = $EMAIL_ERROR_REPORT_TO
+        Subject = 'Errors from Snipeit-Asset-Sync'
+        Body = "There were [$error_count] caught errors from [Snipeit-Asset-Sync.ps1] running on [${ENV:COMPUTERNAME}]. See attached logfile for more details."
+        Priority = 'High'
+        DeliveryNotificationOption = @('OnSuccess', 'OnFailure')
+        SmtpServer = $EMAIL_SMTP
+    }
+    try {
+        # Attempt to send with an attachment. If that throws an error for some reason, try sending without it.
+        Send-MailMessage -Attachments $_logfilepath @params
+    } catch {
+        Write-Error $_
+        $params['Body'] = "There were [$error_count] caught errors from [Snipeit-Asset-Sync.ps1] running on [${ENV:COMPUTERNAME}]. See [$_logfilepath] for more details."
+        Send-MailMessage @params
+    }
+    Write-Host("[{0}] Emailed error report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($EMAIL_ERROR_REPORT_TO -join ", "))
+}
