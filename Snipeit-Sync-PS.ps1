@@ -1008,6 +1008,8 @@ function Get-SnipeItEntityByName {
                 }
                 if (-Not [string]::IsNullOrWhitespace($sp_entity.StatusCode)) {
                     Throw [System.Net.WebException] ("[Get-SnipeItEntityByName] Fatal ERROR creating new snipeit {0} with name [{1}]! StatusCode: {2}, StatusDescription: {3}" -f $EntityType,$Name,$sp_entity.StatusCode,$sp_entity.StatusDescription)
+                } elseif ($sp_entity.id -isnot [int]) {
+                    Throw [System.Net.WebException] ("[Get-SnipeItEntityByName] Fatal ERROR creating new snipeit {0} with name [{1}]! Returned entity has invalid ID" -f $EntityType,$Name)
                 }
             }
         }
@@ -2114,11 +2116,6 @@ function Get-SnipeItModelByName {
                 OnErrorRetry=$OnErrorRetry
                 SleepMS=$SleepMS
             }
-            foreach($param in @("Verbose","Debug")) {
-                if ($PSBoundParameters[$param]) {
-                    $passParams.Add($param, $PSBoundParameters[$param])
-                }
-            }
             try {
                 $sp_entities = Get-SnipeItEntityAll $EntityType
             } catch [System.Net.WebException] {
@@ -2277,6 +2274,8 @@ function Get-SnipeItModelByName {
                 }
                 if (-Not [string]::IsNullOrWhitespace($sp_entity.StatusCode)) {
                     Throw [System.Net.WebException] ("[Get-SnipeItModelByName] Fatal ERROR creating new snipeit {0} with name [{1}]! StatusCode: {2}, StatusDescription: {3}" -f $EntityType,$Name,$sp_entity.StatusCode,$sp_entity.StatusDescription)
+                } elseif ($sp_entity.id -isnot [int]) {
+                    Throw [System.Net.WebException] ("[Get-SnipeItModelByName] Fatal ERROR creating new snipeit {0} with name [{1}]! Returned entity has invalid ID" -f $EntityType,$Name)
                 }
             }
         }
@@ -2908,13 +2907,10 @@ function Sync-SnipeItUser {
             OnErrorRetry=$OnErrorRetry
             SleepMS=$SleepMS
         }
-        foreach($param in @("NoCache","Verbose")) {
+        foreach($param in @("NoCache")) {
             if ($PSBoundParameters[$param]) {
                 $passParams[$param] = $PSBoundParameters[$param]
             }
-        }
-        if (-Not $DebugOutputCreateOnly -And $Debug) {
-            $passParams["Debug"] = $true
         }
 
         # Check to see if we're missing any absolutely required fields
@@ -3215,7 +3211,6 @@ function Sync-SnipeItUser {
                     Write-Warning ("[Sync-SnipeItUser] ERROR creating snipeit user [{0}]! StatusCode: {1}, StatusDescription: {2}, Retries Left: {3}" -f $user_values["username"],$sp_user.StatusCode,$sp_user.StatusDescription,$count_retry)
                 } else {
                     if ([string]::IsNullOrWhitespace($sp_user.StatusCode) -And $sp_user.id -is [int]) {
-                        Write-Verbose ("[Sync-SnipeItUser] Created new snipe-it user [{0}] with employee_num [{1}]" -f $sp_user.username,$sp_user.employee_num)
                         $update_cache = $true
                     }
                     # Break out of loop early on anything except "Too Many Requests"
@@ -3225,10 +3220,16 @@ function Sync-SnipeItUser {
                 Start-Sleep -Milliseconds $SleepMS
             }
             # All attempts failed
-            if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode)) {
-                Throw [System.Net.WebException] ("[Sync-SnipeItUser] Fatal ERROR creating snipeit user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $user_values["username"],$sp_user.StatusCode,$sp_user.StatusDescription)
-            }
-            if ($sp_user.id -is [int]) {
+            if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode) -Or $sp_user.id -isnot [int]) {
+                if (-Not $PSBoundParameters.Debug.IsPresent) {
+                    Write-Host("[Sync-SnipeItUser] Encountered error with create new user parameters: " + ($createParams | ConvertTo-Json -Depth 3))
+                }
+                if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode)) {
+                    Throw [System.Net.WebException] ("[Sync-SnipeItUser] Fatal ERROR creating snipeit user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $user_values["username"],$sp_user.StatusCode,$sp_user.StatusDescription)
+                } elseif ($sp_user.id -isnot [int]) {
+                    Throw [System.Net.WebException] ("[Sync-SnipeItUser] Fatal ERROR creating snipeit user [{0}]! Returned user has invalid ID" -f $user_values["username"])
+                }
+            } else {
                 Write-Verbose ("[Sync-SnipeItUser] Created new snipe-it user with ID: [{0}], username: [{1}], employee_num: [{2}]" -f $sp_user.id,$sp_user.username,$sp_user.employee_num)
             }
         } else {
@@ -3300,9 +3301,11 @@ function Sync-SnipeItUser {
                 }
                 
                 # DEBUG
+                <#
                 if (-Not [string]::IsNullOrEmpty($updateParams["email"])) {
                     Write-Verbose("[Sync-SnipeItUser] Email parameter has been set for updating user [{0}]" -f $user_values["username"])
                 }
+                #>
                 if (-Not $DebugOutputCreateOnly) {
                     Write-Debug("[Sync-SnipeItUser] Update user parameters: " + ($updateParams | ConvertTo-Json -Depth 3))
                 }
@@ -3337,8 +3340,15 @@ function Sync-SnipeItUser {
                     Start-Sleep -Milliseconds $SleepMS
                 }
                 # All attempts failed
-                if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode)) {
-                    Throw [System.Net.WebException] ("[Sync-SnipeItUser] Fatal ERROR updating snipeit user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $user_values["username"],$sp_user.StatusCode,$sp_user.StatusDescription)
+                if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode) -Or $sp_user.id -isnot [int]) {
+                    if (-Not $PSBoundParameters.Debug.IsPresent -Or $DebugOutputCreateOnly) {
+                        Write-Host("[Sync-SnipeItUser] Encountered error with update user parameters: " + ($updateParams | ConvertTo-Json -Depth 3))
+                    }
+                    if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode)) {
+                        Throw [System.Net.WebException] ("[Sync-SnipeItUser] Fatal ERROR updating snipeit user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $user_values["username"],$sp_user.StatusCode,$sp_user.StatusDescription)
+                    } elseif ($sp_user.id -isnot [int]) {
+                        Throw [System.Net.WebException] ("[Sync-SnipeItUser] Fatal ERROR updating snipeit user [{0}]! Returned user has invalid ID" -f $user_values["username"])
+                    }
                 }
             }
         }
@@ -3394,7 +3404,7 @@ function Remove-SnipeItInactiveUsers {
         Returns all inactive snipe-it users found.
         
         .Notes
-        Possible custom thrown exceptions: [System.Net.WebException]
+        This function will write errors instead of throwing an exception.
         
         It's recommended when deleting users to set the ldap_import flag on all your users and use -OnlyIfLdapImport if comparing by username or giving the -AlsoCompareUsername switch. This way the function shouldn't ever delete special users created by functions like Sync-SnipeItDeptUsers.
         
@@ -3552,9 +3562,13 @@ function Remove-SnipeItInactiveUsers {
                                 Start-Sleep -Milliseconds $SleepMS
                             }
                             # All attempts failed
-                            if (-Not [string]::IsNullOrWhitespace($result.StatusCode)) {
-                                Throw [System.Net.WebException] ("[Remove-SnipeItInactiveUsers] Fatal ERROR updating inactive snipeit user [ID: {0}]! StatusCode: {1}, StatusDescription: {2}" -f $sp_user.id,$result.StatusCode,$result.StatusDescription)
-                            }   
+                            if (-Not [string]::IsNullOrWhitespace($sp_user_updated.StatusCode)) {
+                                # Throw [System.Net.WebException] ("[Remove-SnipeItInactiveUsers] Fatal ERROR updating inactive snipeit user [ID: {0}]! StatusCode: {1}, StatusDescription: {2}" -f $sp_user.id,$sp_user_updated.StatusCode,$sp_user_updated.StatusDescription)
+                                Write-Error ("[Remove-SnipeItInactiveUsers] Fatal ERROR updating inactive snipeit user [ID: {0}]! StatusCode: {1}, StatusDescription: {2}" -f $sp_user.id,$sp_user_updated.StatusCode,$sp_user_updated.StatusDescription)
+                            } elseif ($sp_user_updated.id -isnot [int]) {
+                                # Throw [System.Net.WebException] ("[Remove-SnipeItInactiveUsers] Fatal ERROR updating inactive snipeit user [ID: {0}]! Returned user has invalid ID" -f $sp_user.id)
+                                Write-Error ("[Remove-SnipeItInactiveUsers] Fatal ERROR updating inactive snipeit user [ID: {0}]! Returned user has invalid ID" -f $sp_user.id)
+                            }
                         } else {
                             Write-Verbose ("[Remove-SnipeItInactiveUsers] Nothing to update for [$user_deletable] inactive snipe-it user with ID [{0}], username [{1}], employee_num [{2}]" -f $sp_user.id,$sp_user.username,$sp_user.employee_num)
                         }
@@ -3616,7 +3630,7 @@ function Sync-SnipeItDeptUsers {
         None.
         
         .Notes
-        Possible custom thrown exceptions: [System.Net.WebException]
+        This function will write errors instead of throwing an exception.
         
         .Example
         PS> Sync-SnipeItDeptUsers -SyncCompany -SyncLocation -SkipEmptyDepartment
@@ -3658,7 +3672,7 @@ function Sync-SnipeItDeptUsers {
         OnErrorRetry=$OnErrorRetry
         SleepMS=$SleepMS
     }
-    foreach($param in @("Verbose","Debug","NoCache")) {
+    foreach($param in @("NoCache")) {
         if ($PSBoundParameters[$param]) {
             $passParams.Add($param, $PSBoundParameters[$param])
         }
@@ -3720,7 +3734,11 @@ function Sync-SnipeItDeptUsers {
                     }
                     # All attempts failed
                     if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode)) {
-                        Throw [System.Net.WebException] ("[Sync-SnipeItDeptUsers] ERROR creating snipeit departmental user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $username,$sp_user.StatusCode,$sp_user.StatusDescription)
+                        # Throw [System.Net.WebException] ("[Sync-SnipeItDeptUsers] ERROR creating snipeit departmental user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $username,$sp_user.StatusCode,$sp_user.StatusDescription)
+                        Write-Error ("[Sync-SnipeItDeptUsers] ERROR creating snipeit departmental user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $username,$sp_user.StatusCode,$sp_user.StatusDescription)
+                    } elseif ($sp_user.id -isnot [int]) {
+                        # Throw [System.Net.WebException] ("[Sync-SnipeItDeptUsers] ERROR creating snipeit departmental user [{0}]! Returned user has invalid ID" -f $username)
+                        Write-Error ("[Sync-SnipeItDeptUsers] ERROR creating snipeit departmental user [{0}]! Returned user has invalid ID" -f $username)
                     }
                 }
             }
@@ -3996,13 +4014,10 @@ function Sync-SnipeItAsset {
             OnErrorRetry=$OnErrorRetry
             SleepMS=$SleepMS
         }
-        foreach($param in @("NoCache","Verbose")) {
+        foreach($param in @("NoCache")) {
             if ($PSBoundParameters[$param]) {
                 $passParams[$param] = $PSBoundParameters[$param]
             }
-        }
-        if (-Not $DebugOutputCreateOnly -And $Debug) {
-            $passParams["Debug"] = $true
         }
         
         # Lookup Model, in case we don't have a valid Fieldset
@@ -4373,19 +4388,26 @@ function Sync-SnipeItAsset {
                             $count_retry--
                             Write-Warning ("[Sync-SnipeItAsset] [{0}] ERROR creating snipeit asset! StatusCode: {1}, StatusDescription: {2}, Retries Left: {3}" -f $UniqueID,$sp_asset.StatusCode,$sp_asset.StatusDescription,$count_retry)
                         } else {
-                            if ([string]::IsNullOrWhitespace($sp_asset.StatusCode) -And $sp_asset.id -is [int]) {
-                                Write-Verbose ("[Sync-SnipeItAsset] [$UniqueID] Created new snipe-it asset (ID: {0}) with fields: {1}" -f $sp_asset.id,($createFields -join ", "))
-                                $update_cache = $true
-                            }
                             # Break out of loop early on anything except "Too Many Requests"
                             $count_retry = -1
                         }
                         # Sleep before next API call
                         Start-Sleep -Milliseconds $SleepMS
                     }
-                    # All attempts failed
-                    if (-Not [string]::IsNullOrWhitespace($sp_asset.StatusCode)) {
-                        Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR creating snipeit asset [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $UniqueID,$sp_asset.StatusCode,$sp_asset.StatusDescription)
+                    
+                    if (-Not [string]::IsNullOrWhitespace($sp_asset.StatusCode) -Or $sp_asset.id -isnot [int]) {
+                        # All attempts failed
+                        if (-Not $PSBoundParameters.Debug.IsPresent) {
+                            Write-Host("[Sync-SnipeItAsset] Encountered error with create asset parameters: " + ($createParams | ConvertTo-Json -Depth 3))
+                        }
+                        if (-Not [string]::IsNullOrWhitespace($sp_asset.StatusCode)) {
+                            Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by: {1})! StatusCode: {2}, StatusDescription: {3}" -f $UniqueID,$matchfield,$sp_asset.StatusCode,$sp_asset.StatusDescription)
+                        } elseif ($sp_asset.id -isnot [int]) {
+                            Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by: {1})! Returned asset has invalid ID" -f $UniqueID,$matchfield)
+                        }
+                    } else {
+                         Write-Verbose ("[Sync-SnipeItAsset] [$UniqueID] Created new snipe-it asset (ID: {0}) with fields: {1}" -f $sp_asset.id,($createFields -join ", "))
+                         $update_cache = $true
                     }
                 }
             }
@@ -4599,8 +4621,15 @@ function Sync-SnipeItAsset {
                     Start-Sleep -Milliseconds $SleepMS
                 }
                 # All attempts failed
-                if (-Not [string]::IsNullOrWhitespace($sp_asset.StatusCode)) {
-                    Throw [System.Net.WebException] ("Fatal ERROR updating snipeit asset [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $UniqueID,$sp_asset.StatusCode,$sp_asset.StatusDescription)
+                if (-Not [string]::IsNullOrWhitespace($sp_asset.StatusCode) -Or $sp_asset.id -isnot [int]) {
+                    if (-Not $PSBoundParameters.Debug.IsPresent -Or $DebugOutputCreateOnly) {
+                        Write-Host("[Sync-SnipeItAsset] Encountered error with update asset parameters: " + ($updateParams | ConvertTo-Json -Depth 3))
+                    }
+                    if (-Not [string]::IsNullOrWhitespace($sp_asset.StatusCode)) {
+                        Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by: {1})! StatusCode: {2}, StatusDescription: {3}" -f $UniqueID,$matchfield,$sp_asset.StatusCode,$sp_asset.StatusDescription)
+                    } elseif ($sp_asset.id -isnot [int]) {
+                        Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by: {1})! Returned asset has invalid ID" -f $UniqueID,$matchfield)
+                    }
                 }
             }
         }
@@ -4816,7 +4845,7 @@ function Remove-SnipeItInactiveEntity {
     )
     
     $passParams = @{}
-    foreach ($param in @("RefreshCache","Debug","Verbose")) {
+    foreach ($param in @("RefreshCache")) {
         if ($PSBoundParameters[$param]) {
             $passParams[$param] = $true
         }
@@ -4881,9 +4910,9 @@ function Remove-SnipeItInactiveEntity {
                             # Sleep before next API call
                             Start-Sleep -Milliseconds $SleepMS
                         }
-                        # Throw exception on consistent errors
+                        # Write exception on consistent errors
                         if (-Not $update_cache) {
-                            Throw [System.Net.WebException] ("[Remove-SnipeItInactiveEntity] Fatal ERROR removing inactive [{0}] from snipe-it where name=[{1}] and id={2}! StatusCode: {3}, StatusDescription: {4}" -f $entityType,$entity.name,$entity.id,$result.StatusCode,$result.StatusDescription)
+                            Write-Error("[Remove-SnipeItInactiveEntity] Fatal ERROR removing inactive [{0}] from snipe-it where name=[{1}] and id={2}! StatusCode: {3}, StatusDescription: {4}" -f $entityType,$entity.name,$entity.id,$result.StatusCode,$result.StatusDescription)
                         } else {
                             $success = Update-SnipeItCache $entity.id $entityType -Remove
                         }
