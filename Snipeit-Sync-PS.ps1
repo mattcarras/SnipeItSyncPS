@@ -2832,7 +2832,7 @@ function Sync-SnipeItUser {
         # Username must always be non-blank (and employee_num must be non-blank IF SyncOnEmployeeNum is set).
         # first_name and last_name are also always required.
         [parameter(Mandatory=$false)]
-        [ValidateSet("employee_num", "email", "phone", "notes", "jobtitle", "activated", "ldap_import", "image", "company_id", "department_id", "location_id", "manager_id")]
+        [ValidateSet("employee_num", "email", "password", "phone", "notes", "jobtitle", "activated", "ldap_import", "image", "company_id", "department_id", "location_id", "manager_id")]
         [AllowEmptyCollection()]
         [string[]]$RequiredSyncFields=@("department_id"),
         
@@ -2945,7 +2945,7 @@ function Sync-SnipeItUser {
         foreach ($field in $_NONREQUIREDFIELDS) {
             if ($field -ne "groups") {
                 if (-Not [string]::IsNullOrEmpty($User.$field)) {
-                    if ($Trim -And $User.$field -is [string]) {
+                    if ($Trim -And $User.$field -is [string] -And $field -ne "password") {
                         $user_values[$field] = $User.$field.Trim()
                     } else {
                         $user_values[$field] = $User.$field
@@ -3193,15 +3193,19 @@ function Sync-SnipeItUser {
             }
             # Generate password if needed.
             if ([string]::IsNullOrEmpty($createParams["password"])) {
+                if (-Not $PSBoundParameters.Debug.IsPresent) {
+                    Write-Verbose("[Sync-SnipeItUser] Generating random password for user [{0}]" -f $user_values["username"])
+                }
                 Add-Type -AssemblyName 'System.Web'
                 $createParams["password"] = [System.Web.Security.Membership]::GeneratePassword(30, 4)
             }
             
-            # DEBUG
-            if (-Not [string]::IsNullOrEmpty($createParams["email"])) {
-                Write-Verbose("[Sync-SnipeItUser] Email parameter has been set for creating user [{0}]" -f $user_values["username"])
-            }
-            Write-Debug("[Sync-SnipeItUser] Create new user parameters: " + ($createParams | ConvertTo-Json -Depth 3))
+            # Make sure password is redacted in any logged output
+            # Note -Debug switch may still show password from SnipeitPS's output
+            $createParamsText = $createParams.Clone()
+            $createParamsText["password"] = '<PASSWORD REDACTED>'
+            $createParamsText = $createParamsText | ConvertTo-Json -Depth 3
+            Write-Debug("[Sync-SnipeItUser] Create new user parameters: $createParamsText")
             
             $count_retry = $OnErrorRetry
             while ($count_retry -ge 0) {
@@ -3222,7 +3226,7 @@ function Sync-SnipeItUser {
             # All attempts failed
             if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode) -Or $sp_user.id -isnot [int]) {
                 if (-Not $PSBoundParameters.Debug.IsPresent) {
-                    Write-Host("[Sync-SnipeItUser] Encountered error with create new user parameters: " + ($createParams | ConvertTo-Json -Depth 3))
+                    Write-Host("[Sync-SnipeItUser] Encountered error with create new user parameters: $createParamsText")
                 }
                 if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode)) {
                     Throw [System.Net.WebException] ("[Sync-SnipeItUser] Fatal ERROR creating snipeit user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $user_values["username"],$sp_user.StatusCode,$sp_user.StatusDescription)
@@ -3258,7 +3262,7 @@ function Sync-SnipeItUser {
             
             # All other fields except notes and groups.
             foreach($field in $_BUILTINFIELDS) {
-                if ($field -ne "notes" -And $field -ne "groups" -And -Not $updateParams.ContainsKey($field)) {
+                if ($field -ne "notes" -And $field -ne "groups" -And $field -ne "password" -And -Not $updateParams.ContainsKey($field)) {
                     $val = $user_values[$field]
                     $spval = $sp_user.$field
                     if ($val -is [string]) {
@@ -3290,6 +3294,10 @@ function Sync-SnipeItUser {
                     $updateParams.Add("groups", $user_values["groups"])
                 }
             }
+            # Update the password, if given.
+            if (-Not [string]::IsNullOrEmpty($user_values["password"])) {
+                $updateParams.Add("password", $user_values["password"])
+            }
             # If we have update parameters, call Set-SnipeitUser.
             if ($updateParams.Count -gt 0) {
                 Write-Verbose ("[Sync-SnipeItUser] User [{0}] (employee_num: [{1}]) requires updates for fields: {2}" -f $sp_user.username,$sp_user.employee_num,($updateParams.Keys -join ", "))
@@ -3300,14 +3308,16 @@ function Sync-SnipeItUser {
                     return $sp_user
                 }
                 
-                # DEBUG
-                <#
-                if (-Not [string]::IsNullOrEmpty($updateParams["email"])) {
-                    Write-Verbose("[Sync-SnipeItUser] Email parameter has been set for updating user [{0}]" -f $user_values["username"])
+                # Make sure password is redacted in any logged output
+                # Note -Debug switch may still show password from SnipeitPS's output
+                $updateParamsText = $updateParams.Clone()
+                if ($updateParamsText.ContainsKey("password")) {
+                    $updateParamsText["password"] = '<PASSWORD REDACTED>'
                 }
-                #>
+                $updateParamsText = $updateParamsText | ConvertTo-Json -Depth 3
+                
                 if (-Not $DebugOutputCreateOnly) {
-                    Write-Debug("[Sync-SnipeItUser] Update user parameters: " + ($updateParams | ConvertTo-Json -Depth 3))
+                    Write-Debug("[Sync-SnipeItUser] Update user parameters: $updateParamsText")
                 }
                 
                 $count_retry = $OnErrorRetry
@@ -3342,7 +3352,7 @@ function Sync-SnipeItUser {
                 # All attempts failed
                 if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode) -Or $sp_user.id -isnot [int]) {
                     if (-Not $PSBoundParameters.Debug.IsPresent -Or $DebugOutputCreateOnly) {
-                        Write-Host("[Sync-SnipeItUser] Encountered error with update user parameters: " + ($updateParams | ConvertTo-Json -Depth 3))
+                        Write-Host("[Sync-SnipeItUser] Encountered error with update user parameters: $updateParamsText")
                     }
                     if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode)) {
                         Throw [System.Net.WebException] ("[Sync-SnipeItUser] Fatal ERROR updating snipeit user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $user_values["username"],$sp_user.StatusCode,$sp_user.StatusDescription)
