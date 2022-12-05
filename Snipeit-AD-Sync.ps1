@@ -356,7 +356,7 @@ $ad_users = $AD_GROUP_TARGETS | foreach {
             $activated = $_.activated 
         }
         $groups = $null 
-        if ($_.groups -is [int] -Or $_.groups -is [array]) {
+        if (($_.groups | Select -First 1) -is [int]) {
             $groups = $_.groups 
         }
         
@@ -461,22 +461,21 @@ if ($formatted_users.Count -gt 0 -And -Not $AD_SYNC_DELETED_USERS_SKIP) {
         
         if ($inactive_users.Count -gt 0) {
             # Add department along with username, if it exists
-            $inactive_users_undeletable = $inactive_users | where {$_.available_actions.delete -eq $false} | Select @{N="_UsernameWithDept"; Expression={ if (-Not [string]::IsNullOrEmpty($_.department.name)) { ("{0} ({1})" -f $_.username, [System.Net.WebUtility]::HtmlDecode($_.department.name)) } else { $_.username }}} | Select -ExpandProperty _UsernameWithDept
+            $inactive_users_undeletable = $inactive_users | where {$_.available_actions.delete -eq $false} | Select *,@{N="_UsernameWithDept"; Expression={ if (-Not [string]::IsNullOrEmpty($_.department.name)) { ("{0} ({1})" -f $_.username, [System.Net.WebUtility]::HtmlDecode($_.department.name)) } else { $_.username }}}
             $inactive_users_undeletable_count = $inactive_users_undeletable.Count
-            $inactive_users_undeletable = $inactive_users_undeletable -join ", "
             $inactive_users_deletable = $inactive_users | where {$_.available_actions.delete -eq $true} | Select -ExpandProperty username
             $inactive_users_deletable_count = $inactive_users_deletable.Count
             $inactive_users_deletable = $inactive_users_deletable -join ", "
             if (-Not [string]::IsNullOrEmpty($inactive_users_undeletable)) {
-                Write-Host('[{0}] Inactive snipe-it users that no longer exist in AD and CANNOT be deleted: {1}' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $inactive_users_undeletable)
+                Write-Host('[{0}] Inactive snipe-it users that no longer exist in AD and CANNOT be deleted: {1}' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($inactive_users_undeletable._UsernameWithDept -join ", "))
             }
             if (-Not [string]::IsNullOrEmpty($inactive_users_deletable)) {
                 Write-Host('[{0}] Inactive snipe-it users that no longer exist in AD and can/have been deleted: {1}' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $inactive_users_deletable)
             }
-            if (-Not [string]::IsNullOrWhiteSpace($AD_SYNC_DELETED_USERS_EXPORT_PATH)) {
-                $inactive_users | Select *,@{N="_DELETABLE_"; Expression={ $_.available_actions.delete -eq $true }} | Format-SnipeItEntity | Export-CSV -NoTypeInformation $AD_SYNC_DELETED_USERS_EXPORT_PATH
-                if (Test-Path $AD_SYNC_DELETED_USERS_EXPORT_PATH -PathType Leaf) {
-                    Write-Host('[{0}] Inactive user report has been saved to [{1}].' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $AD_SYNC_DELETED_USERS_EXPORT_PATH)
+            if (-Not [string]::IsNullOrWhiteSpace($AD_SYNC_EXPORT_DELETED_USERS_PATH)) {
+                $inactive_users | Select *,@{N="_DELETABLE_"; Expression={ $_.available_actions.delete -eq $true }} | Format-SnipeItEntity | Select username,first_name,last_name,employee_num,jobtitle,department,name,location,manager,notes,* -ExcludeProperty username,first_name,last_name,employee_num,jobtitle,department,name,location,manager,notes | Export-CSV -NoTypeInformation -Force $AD_SYNC_EXPORT_DELETED_USERS_PATH
+                if (Test-Path $AD_SYNC_EXPORT_DELETED_USERS_PATH -PathType Leaf) {
+                    Write-Host('[{0}] Inactive user report has been saved to [{1}].' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $AD_SYNC_EXPORT_DELETED_USERS_PATH)
                 }
             }
         }
@@ -485,38 +484,89 @@ if ($formatted_users.Count -gt 0 -And -Not $AD_SYNC_DELETED_USERS_SKIP) {
 
 Write-Host("[{0}] Caught {1} errors" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $error_count)
 
-# Email out a report on deleted users.
-if ($EMAIL_DELETED_USERS_REPORT -Or $EmailDeletedUsersReport) {
-    if ([string]::IsNullOrWhiteSpace($EMAIL_SMTP) -Or [string]::IsNullOrWhiteSpace($EMAIL_DELETED_USERS_REPORT_FROM) -Or -Not ($EMAIL_DELETED_USERS_REPORT_TO -is [string] -Or ($EMAIL_DELETED_USERS_REPORT_TO -is [array] -And $EMAIL_DELETED_USERS_REPORT_TO.Count -gt 0)) -Or [string]::IsNullOrEmpty($EMAIL_DELETED_USERS_REPORT_SUBJECT)) {
-        Write-Error("Cannot email deleted users report -- invalid parameters (are EMAIL_SMTP, EMAIL_DELETED_USERS_REPORT_FROM, EMAIL_DELETED_USERS_REPORT_TO, and EMAIL_DELETED_USERS_REPORT_SUBJECT set correctly?)")
-    } elseif (-Not [string]::IsNullOrEmpty($inactive_users_undeletable) -And $inactive_users -ne $null) {
-        $total_count = $inactive_users.Count
-        $datestamp = (Get-Date).toString("yyyy/MM/dd HH:mm:ss")
-        if (($AD_SYNC_DELETED_USERS_PURGE -Or $ADSyncDeletedUsersPurge) -And -Not $AD_SYNC_DELETED_USERS_REPORT_ONLY) {
-            $deletable_action = "have been removed"
-        } else {
-            $deletable_action = "can be removed"
-        }
-        $body = @"
-There are [$total_count] users in Snipe-It that no longer exist in target AD group(s), of which [$inactive_users_deletable_count] ${deletable_action}. A user must have all their assignments checked in before they can be deleted.
+# Email out notifications
+if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP)) {    
+    # Email out a report on deleted users.
+    if ($EMAIL_DELETED_USERS_REPORT -Or $EmailDeletedUsersReport) {
+        if (-Not [string]::IsNullOrEmpty($inactive_users_undeletable) -And $inactive_users -ne $null -And -Not [string]::IsNullOrWhiteSpace($EMAIL_DELETED_USERS_REPORT_FROM) -And -Not [string]::IsNullOrEmpty($emailDeletedUsersReportTo) -And -Not [string]::IsNullOrEmpty($EMAIL_DELETED_USERS_REPORT_SUBJECT)) {
+            $total_count = $inactive_users.Count
+            $datestamp = (Get-Date).toString("yyyy/MM/dd HH:mm:ss")
+            if (($AD_SYNC_DELETED_USERS_PURGE -Or $ADSyncDeletedUsersPurge) -And -Not $AD_SYNC_DELETED_USERS_REPORT_ONLY) {
+                $deletable_action = "have been removed"
+            } else {
+                $deletable_action = "can be removed"
+            }
+            $body = @"
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"  "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head>
+<meta http-equiv="Content-Type" content="text/html; charset=us-ascii"><title>HTML TABLE</title>
+</head><body>
+<p>There are [$total_count] users in Snipe-It that no longer exist in target AD group(s), of which [$inactive_users_deletable_count] ${deletable_action}. A user must have all their assignments checked in before they can be deleted.</p>
 
-Inactive snipe-it users which cannot be deleted: $inactive_users_undeletable
-
-A report has been saved to [$AD_SYNC_EXPORT_DELETED_USERS_PATH].
-
-This message generated on [$datestamp] from [Snipeit-AD-Sync.ps1] running on [${ENV:COMPUTERNAME}].
+<p>Inactive snipe-it users which cannot be deleted:</p>
+<table border="1">
+<tr><td>Username</td><td>Department (Last Known)</td><td>Exists in AD</td><td>Assignments</td></tr>
 "@
-        Send-MailMessage -From $EMAIL_DELETED_USERS_REPORT_FROM -To $EMAIL_DELETED_USERS_REPORT_TO -Subject $EMAIL_DELETED_USERS_REPORT_SUBJECT -Body $body -Priority High -DeliveryNotificationOption OnSuccess, OnFailure -SmtpServer $EMAIL_SMTP
-        Write-Host("[{0}] Emailed inactive user report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($EMAIL_DELETED_USERS_REPORT_TO -join ", "))
+            # Double-check whether the user still exists in AD at all.
+            foreach($user in $inactive_users_undeletable) {
+                $adUser = $null
+                try {
+                    $id = $null
+                    if ($AD_SYNC_ON_EMPLOYEE_NUM -And -Not [string]::IsNullOrEmpty($user.employee_num) -And ($AD_GROUP_PROPERTY_MAP['employee_num'] -eq 'SID' -Or [string]::IsNullOrEmpty($AD_GROUP_PROPERTY_MAP['employee_num']))) {
+                        $id = $user.employee_num
+                        $prop = $AD_GROUP_PROPERTY_MAP['employee_num']
+                    } else {
+                        $prop = $AD_GROUP_PROPERTY_MAP['username']
+                        if (-Not $user.username.Contains('@')) {
+                            $id = $user.username
+                        }
+                    }
+                    if (-Not [string]::IsNullOrEmpty($id)) {
+                        $adUser = Get-ADUser $id -ErrorAction SilentlyContinue
+                    } else {
+                        $un = $user.username
+                        if (-Not [string]::IsNullOrEmpty($prop)) {
+                            $adUser = Get-ADUser -LDAPFilter "($prop=$un)" -ErrorAction SilentlyContinue | Select -First 1
+                        } else {
+                            $adUser = Get-ADUser -LDAPFilter "(|(UserPrincipalName=$un)(mail=$un))" -ErrorAction SilentlyContinue | Select -First 1
+                        }
+                    }
+                } catch {}
+                $existsInAD = ($adUser.Enabled -eq $true)
+                if (-Not $existsInAD) { $existsInAD = "<b>False</b>" }
+                $username = $user.username
+                if (-Not [string]::IsNullOrEmpty($spHostURL)) {
+                    $username = '<a href="{0}users/{1}">{2}</a>' -f $spHostURL, $user.id, $user.username
+                }
+                # Just in case one of these counts do not resolve to an integer.
+                $total = $null
+                try {
+                    $total = $user.assets_count + $user.licenses_count + $user.consumables_count + $user.accessories_count
+                } catch {
+                    Write-Error $_
+                    $total = 'ERROR'
+                }
+                # Add row for user.
+                $body += ('<tr><td>{0}</td><td>{1}</td><td style="text-align: center;">{2}</td><td style="text-align: center;">{3}</td></tr>' -f $username, $user.department.name, $existsInAD, $total)
+            }
+            $body += @"
+</table>
+
+<p>A report has been saved to [<a href="file://$AD_SYNC_EXPORT_DELETED_USERS_PATH">$AD_SYNC_EXPORT_DELETED_USERS_PATH</a>].</p>
+
+<p>This message generated on [$datestamp] from [Snipeit-AD-Sync.ps1] running on [${ENV:COMPUTERNAME}].</p>
+</body></html>
+"@
+            Send-MailMessage -From $EMAIL_DELETED_USERS_REPORT_FROM -To $emailDeletedUsersReportTo -Subject $EMAIL_DELETED_USERS_REPORT_SUBJECT -Body $body -Priority High -DeliveryNotificationOption OnSuccess, OnFailure -SmtpServer $EMAIL_SMTP -BodyAsHtml
+            Write-Host("[{0}] Emailed inactive user report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($emailDeletedUsersReportTo -join ", "))
+        }
     }
-}
 
-# Stop logging
-Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+    # Stop logging
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 
-# Email out notifications of any errors.
-if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP) -And ($error_count -gt 0 -And -Not [string]::IsNullOrWhiteSpace($EMAIL_ERROR_REPORT_FROM) -And ($EMAIL_ERROR_REPORT_TO -is [string] -Or ($EMAIL_ERROR_REPORT_TO -is [array] -And $EMAIL_ERROR_REPORT_TO.Count -gt 0)))) {
-    $params = @{
+    # Email out notifications of any errors.
+    if ($error_count -gt 0 -And -Not [string]::IsNullOrEmpty($EMAIL_ERROR_REPORT_FROM) -And -Not [string]::IsNullOrEmpty($EMAIL_ERROR_REPORT_TO)) {
+        $params = @{
         From = $EMAIL_ERROR_REPORT_FROM
         To = $EMAIL_ERROR_REPORT_TO
         Subject = 'Errors from Snipeit-AD-Sync'
@@ -524,14 +574,18 @@ if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP) -And ($error_count -gt 0 -And
         Priority = 'High'
         DeliveryNotificationOption = @('OnSuccess', 'OnFailure')
         SmtpServer = $EMAIL_SMTP
+        }
+        try {
+            # Attempt to send with an attachment. If that throws an error for some reason, try sending without it.
+            Send-MailMessage -Attachments $_logfilepath @params
+        } catch {
+            Write-Error $_
+            $params['Body'] = "There were [$error_count] caught errors from [Snipeit-AD-Sync.ps1] running on [${ENV:COMPUTERNAME}]. See [$_logfilepath] for more details."
+            Send-MailMessage @params
+        }
+        Write-Host("[{0}] Emailed error report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($EMAIL_ERROR_REPORT_TO -join ", "))
     }
-    try {
-        # Attempt to send with an attachment. If that throws an error for some reason, try sending without it.
-        Send-MailMessage -Attachments $_logfilepath @params
-    } catch {
-        Write-Error $_
-        $params['Body'] = "There were [$error_count] caught errors from [Snipeit-AD-Sync.ps1] running on [${ENV:COMPUTERNAME}]. See [$_logfilepath] for more details."
-        Send-MailMessage @params
-    }
-    Write-Host("[{0}] Emailed error report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($EMAIL_ERROR_REPORT_TO -join ", "))
 }
+
+# Stop logging if we haven't stopped already
+Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
