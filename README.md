@@ -52,7 +52,7 @@ Use `get-help <Function> -Full` for more information about each function (e.g. `
 - `Sync-SnipeItUser` -- For syncing users.
 - `Remove-SnipeItInactiveUsers` -- Used to flag/purge/report inactive users.
 - `Sync-SnipeItDeptUsers` -- Allows for creating special users for each department, to allow assigning assets to departments.
-- `Sync-SnipeItAsset` -- For syncing assets.
+- `Sync-SnipeItAsset` -- For syncing assets. This can also checkout synced assets as well.
 - `Format-SnipeItAsset` -- For formatting assets for output to file (IE, CSV).
 - `Format-SnipeItEntity` -- For formatting other snipe-it entities for output to file (IE, CSV).
 - `Remove-SnipeItInactiveEntity` -- Removing inactive/unassigned snipe-it objects other than users and assets (models, departments, etc.)
