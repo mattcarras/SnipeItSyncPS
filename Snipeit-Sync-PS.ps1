@@ -17,6 +17,19 @@ $SNIPEIT_RETRY_ON_STATUS_CODES = @("429","Too Many Requests","422","Unprocessabl
 # We use this later to access private functions.
 $_SNIPEITPSFEATURES = Import-Module SnipeitPS -PassThru
 
+# Define custom exceptions.
+class SnipeItSyncValidationException : System.Exception {
+    SnipeItSyncValidationException($Message) : base("Data validation exception: $Message") {}
+}
+
+class SnipeItSyncObjectNotFoundException : System.Exception {
+   SnipeItSyncObjectNotFoundException($Message) : base("Object not found exception: $Message") {}
+}
+
+class SnipeItSyncDuplicateNameException : System.Exception {
+    SnipeItSyncDuplicateNameException($Message) : base("Duplicate name exception: $Message") {}
+}
+
 function Export-SnipeItCredentials {
     <#
         .SYNOPSIS
@@ -274,7 +287,7 @@ function Get-SnipeItEntityAll {
         
         The dupe-checking is mostly helpful for entities that currently do not constrain uniqueness in names, such as departments, or for the employee_num field in users.
 
-        Possible custom thrown exceptions: [System.Management.Automation.ValidationMetadataException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        Possible custom thrown exceptions: [System.Management.Automation.ValidationMetadataException], [SnipeItSyncDuplicateNameException], [System.Net.WebException]
 
         .Example
         PS> $sp_departments = Get-SnipeItEntityAll "departments"
@@ -290,7 +303,7 @@ function Get-SnipeItEntityAll {
         [string]$UsersKey="username",
 
         [parameter(Mandatory=$false)]
-        [switch]$ExcludeArchivedAssets,
+        [switch]$ExcludeArchived,
         
         [parameter(Mandatory=$false)]
         [ValidateRange(0,[int]::MaxValue)]
@@ -373,7 +386,7 @@ function Get-SnipeItEntityAll {
         }
         default {
             # Should never get here
-            Throw [System.Management.Automation.ValidationMetadataException] "[Get-SnipeItEntityAll] Unsupported EntityType: $EntityType (should never get here?)"
+            Throw [System.ArgumentException] "[Get-SnipeItEntityAll] Unsupported EntityType: $EntityType (should never get here?)"
         }
     }
     $sp_entities = $null
@@ -420,10 +433,13 @@ function Get-SnipeItEntityAll {
 
             # Check and warn about dupes
             $sp_entities | where {[string]::IsNullOrEmpty($_.$primaryKey) -ne $true} | Group-Object -Property $primaryKey | where {$_.Count -gt 1} | foreach {
-                if ($ErrorOnDupe) {
-                    Throw [System.Data.DuplicateNameException] ("[Get-SnipeItEntityAll] Got back {0} non-unique [{1}] where [{2}]=[{3}] and -ErrorOnDupe is set" -f $_.Count,$EntityType,$primaryKey,($_.Group.$primaryKey | Select -First 1))
-                } else {
-                    Write-Warning ("[Get-SnipeItEntityAll] Found {0} non-unique [{1}] where [{2}]=[{3}]" -f $_.Count,$EntityType,$primaryKey,($_.Group.$primaryKey | Select -First 1))
+                # If this is a model, check to see if the model_number is different before declaring a dupe.
+                if ($EntityType -ne 'models' -Or (($_.Group.model_number | Select -Unique).Count -eq 1)) {                  
+                    if ($ErrorOnDupe) {
+                        Throw [SnipeItSyncDuplicateNameException] ("[Get-SnipeItEntityAll] Got back {0} non-unique [{1}] where [{2}]=[{3}] and -ErrorOnDupe is set" -f $_.Count,$EntityType,$primaryKey,($_.Group.$primaryKey | Select -First 1))
+                    } else {
+                        Write-Warning ("[Get-SnipeItEntityAll] Found {0} non-unique [{1}] where [{2}]=[{3}]" -f $_.Count,$EntityType,$primaryKey,($_.Group.$primaryKey | Select -First 1))
+                    }
                 }
             }
 
@@ -563,7 +579,7 @@ function Initialize-SnipeItCache {
         
         .Notes
         Possible custom thrown exceptions: [System.Data.NoNullAllowedException]
-        Possible custom thrown exceptions from Get-SnipeItEntityAll: [System.Management.Automation.ValidationMetadataException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        Possible custom thrown exceptions from Get-SnipeItEntityAll: [System.ArgumentException], [SnipeItSyncDuplicateNameException], [System.Net.WebException]
 
         .Example
         PS> Initialize-SnipeItCache @("users", "departments", "companies", "locations")
@@ -730,7 +746,7 @@ function Select-SnipeItFilteredEntity {
         Required. One or more snipe-it entity objects to filter.
 
         .PARAMETER Params
-        Required. A hashtable of parameter values to filter. If the key name is in the form '<parameter>_id', check against '$_.<parameter>.id'. If the key name is in the form '<parameter>_<<name>>', check against '$_.<parameter>.name'.
+        Required. A hashtable of parameter values to filter. If the value of any key is also a hashtable, map it to appropriate values. E.g., @{manufacturer=@{name='Foo'}} will select instances where $Entity.manufacturer.name -eq 'Foo'.
 
         .PARAMETER All
         Filter by all parameters given (using -AND), instead of looking for matches one at a time.
@@ -739,7 +755,7 @@ function Select-SnipeItFilteredEntity {
         The filtered set of snipe-it entity objects.
 
         .Example
-        PS> Select-SnipeItFilteredEntity $sp_entities @{ 'model_id' = 1 }
+        PS> Select-SnipeItFilteredEntity $sp_entities @{model = @{id = 1 }}
     #>
     param (
         [parameter(Mandatory=$true,
@@ -761,17 +777,19 @@ function Select-SnipeItFilteredEntity {
         if ($_entity.Count -gt 1) {
             $filterScript = $null
             foreach($pair in $Params.GetEnumerator()) {
-                if ($pair.Name -ne "image" -And $pair.Name -ne "image_delete") {
-                    if ($pair.Name -like '*_id') {
-                        $name = '{0}.id' -f $pair.Name
-                    } elseif ($pair.Name -like '*_<name>') {
-                        $name = '{0}.name' -f $pair.Name
+                if ($pair.Name -ne 'image' -And $pair.Name -ne 'image_delete') {
+                    $val = $pair.Value
+                    if ($val -is [hashtable]) {
+                        foreach($vpair in $val.GetEnumerator()) {
+                            $val = $vpair.Value
+                            $name = '{0}.{1}' -f $pair.Name,$vpair.Name
+                        }
                     } else {
                         $name = $pair.Name
                     }
-                    if (-Not [string]::IsNullOrEmpty($pair.Value)) {
+                    if (-Not [string]::IsNullOrEmpty($val)) {
                         if ($pair.Value -is [string]) {
-                            $f = '[System.Net.WebUtility]::HtmlDecode($_.{0}).Trim() -eq "{1}"' -f $name, $pair.Value.Trim()
+                            $f = '([System.Net.WebUtility]::HtmlDecode($_.{0})).Trim() -eq "{1}"' -f $name, $val.Trim()
                         } elseif ($pair.Value -is [bool]) {
                             $f = '$_.{0} -eq ${1}' -f $name, $pair.Value
                         } elseif ($pair.Value -is [int]) {
@@ -826,7 +844,7 @@ function Get-SnipeItEntityByName {
         These parameters will also be used to further filter the results if more than one entity is returned.
 
         .PARAMETER ErrorOnDupe
-        Throw [System.Data.DuplicateNameException] on finding a duplicate name instead of giving a warning.
+        Throw [SnipeItSyncDuplicateNameException] on finding a duplicate name instead of giving a warning.
 
         .PARAMETER DontCreateIfNotFound
         Don't create a new snipe-it entity if not found. This is ignored for "fieldsets" and "statuslabels", which are never created.
@@ -844,7 +862,7 @@ function Get-SnipeItEntityByName {
         The returned snipe-it entity object.
         
         .Notes
-        Possible custom thrown exceptions: [System.Management.Automation.ValidationMetadataException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        Possible custom thrown exceptions: [System.ArgumentException], [SnipeItSyncDuplicateNameException], [System.Net.WebException]
 
         .Example
         PS> Get-SnipeItEntityByName "IT" "departments"
@@ -911,7 +929,7 @@ function Get-SnipeItEntityByName {
                 "categories" {
                     $createFunc = "New-SnipeItCategory"
                     if ($CreateParams -eq $null -Or $CreateParams["category_type"] -notin @("asset", "accessory", "consumable", "component", "license")) {
-                        Throw [System.Management.Automation.ValidationMetadataException] ("[Get-SnipeItEntityByName] Missing or invalid 'category_type' required parameter to CreateParams for New-SnipeItCategory: [{0}]" -f $CreateParams["category_type"])
+                        Throw [System.ArgumentException] ("[Get-SnipeItEntityByName] Missing or invalid 'category_type' required parameter to CreateParams for New-SnipeItCategory: [{0}]" -f $CreateParams["category_type"])
                     }
                 }
                 "suppliers" {
@@ -928,7 +946,7 @@ function Get-SnipeItEntityByName {
                 }
                 default {
                     # Should never get here
-                    Throw [System.Management.Automation.ValidationMetadataException] "[Get-SnipeItEntityByName] Unsupported EntityType: $EntityType (should never get here?)"
+                    Throw [System.ArgumentException] "[Get-SnipeItEntityByName] Unsupported EntityType: $EntityType (should never get here?)"
                 }
             }
         }
@@ -979,7 +997,7 @@ function Get-SnipeItEntityByName {
             # Check to see if we still have more than one result
             if ($sp_entity.Count -gt 1) {   
                 if ($ErrorOnDupe) {
-                    Throw [System.Data.DuplicateNameException] ("[Get-SnipeItEntityByName] {0} results returned for [{1}] with name [{2}] and -ErrorOnDupe is set" -f $sp_entity.Count, $EntityType, $name)
+                    Throw [SnipeItSyncDuplicateNameException] ("[Get-SnipeItEntityByName] {0} results returned for [{1}] with name [{2}] and -ErrorOnDupe is set" -f $sp_entity.Count, $EntityType, $name)
                 } else {
                     Write-Warning ("[Get-SnipeItEntityByName] {0} results returned for [{1}] with name [{2}], using first result" -f $sp_entity.Count, $EntityType, $name)
                     $sp_entity = $sp_entity | Select -First 1
@@ -1038,7 +1056,7 @@ function Get-SnipeItCompanyByName {
         Image file to be passed to New-SnipeItCompany if created.
 
         .PARAMETER ErrorOnDupe
-        Throw [System.Data.DuplicateNameException] on finding a duplicate name instead of giving a warning.
+        Throw [SnipeItSyncDuplicateNameException] on finding a duplicate name instead of giving a warning.
 
         .PARAMETER DontCreateIfNotFound
         Don't create a new snipe-it company if not found.
@@ -1056,7 +1074,7 @@ function Get-SnipeItCompanyByName {
         The returned snipe-it company object.
         
         .Notes
-        Possible custom thrown exceptions (from Get-SnipeItEntityByName): [System.Management.Automation.ValidationMetadataException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        Possible custom thrown exceptions: see get-help Get-SnipeItEntityByName.
 
         .Example
         PS> Get-SnipeItCompanyByName "Test Company"
@@ -1141,7 +1159,7 @@ function Get-SnipeItDepartmentByName {
         Parameter to be passed to New-SnipeItDepartment if created.
 
         .PARAMETER ErrorOnDupe
-        Throw [System.Data.DuplicateNameException] on finding a duplicate name instead of giving a warning.
+        Throw [SnipeItSyncDuplicateNameException] on finding a duplicate name instead of giving a warning.
 
         .PARAMETER DontCreateIfNotFound
         Don't create a new snipe-it department if not found.
@@ -1159,7 +1177,7 @@ function Get-SnipeItDepartmentByName {
         The returned snipe-it department object.
         
         .Notes
-        Possible custom thrown exceptions (from Get-SnipeItEntityByName): [System.Management.Automation.ValidationMetadataException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        Possible custom thrown exceptions: see get-help Get-SnipeItEntityByName.
 
         .Example
         PS> Get-SnipeItDepartmentByName "IT" -company_id 1
@@ -1292,7 +1310,7 @@ function Get-SnipeItLocationByName {
         Parameter to be passed to New-SnipeItLocation if created.
 
         .PARAMETER ErrorOnDupe
-        Throw [System.Data.DuplicateNameException] on finding a duplicate name instead of giving a warning.
+        Throw [SnipeItSyncDuplicateNameException] on finding a duplicate name instead of giving a warning.
 
         .PARAMETER DontCreateIfNotFound
         Don't create a new snipe-it location if not found.
@@ -1310,7 +1328,7 @@ function Get-SnipeItLocationByName {
         The returned snipe-it location object.
         
         .Notes
-        Possible custom thrown exceptions (from Get-SnipeItEntityByName): [System.Management.Automation.ValidationMetadataException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        Possible custom thrown exceptions: see get-help Get-SnipeItEntityByName.
 
         .Example
         PS> Get-SnipeItLocationByName "New Brunswick" -Country "CA"
@@ -1439,7 +1457,7 @@ function Get-SnipeItCategoryByName {
         Parameter to be passed to New-SnipeItCategory if created.
 
         .PARAMETER ErrorOnDupe
-        Throw [System.Data.DuplicateNameException] on finding a duplicate name instead of giving a warning.
+        Throw [SnipeItSyncDuplicateNameException] on finding a duplicate name instead of giving a warning.
 
         .PARAMETER DontCreateIfNotFound
         Don't create a new snipe-it category if not found. 
@@ -1457,7 +1475,7 @@ function Get-SnipeItCategoryByName {
         The returned snipe-it category.
         
         .Notes
-        Possible custom thrown exceptions (from Get-SnipeItEntityByName): [System.Management.Automation.ValidationMetadataException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        Possible custom thrown exceptions: see get-help Get-SnipeItEntityByName.
 
         .Example
         PS> Get-SnipeItCategoryByName "PC" -category_type "asset"
@@ -1557,7 +1575,7 @@ function Get-SnipeItManufacturerByName {
         Parameter to be passed to New-SnipeItManufacturer if created.
 
         .PARAMETER ErrorOnDupe
-        Throw [System.Data.DuplicateNameException] on finding a duplicate name instead of giving a warning.
+        Throw [SnipeItSyncDuplicateNameException] on finding a duplicate name instead of giving a warning.
 
         .PARAMETER DontCreateIfNotFound
         Don't create a new snipe-it manufacturer if not found.
@@ -1575,7 +1593,7 @@ function Get-SnipeItManufacturerByName {
         The returned snipe-it manufacturer.
         
         .Notes
-        Possible custom thrown exceptions (from Get-SnipeItEntityByName): [System.Management.Automation.ValidationMetadataException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        Possible custom thrown exceptions: see get-help Get-SnipeItEntityByName.
 
         .Example
         PS> Get-SnipeItManufacturerByName "PC" -manufacturer_type "asset"
@@ -1678,7 +1696,7 @@ function Get-SnipeItSupplierByName {
         Image file to be passed to New-SnipeItsupplier if created.
 
         .PARAMETER ErrorOnDupe
-        Throw [System.Data.DuplicateNameException] on finding a duplicate name instead of giving a warning.
+        Throw [SnipeItSyncDuplicateNameException] on finding a duplicate name instead of giving a warning.
 
         .PARAMETER DontCreateIfNotFound
         Don't create a new snipe-it supplier if not found.
@@ -1696,7 +1714,7 @@ function Get-SnipeItSupplierByName {
         The returned snipe-it supplier object.
         
         .Notes
-        Possible custom thrown exceptions (from Get-SnipeItEntityByName): [System.Management.Automation.ValidationMetadataException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        Possible custom thrown exceptions: see get-help Get-SnipeItEntityByName.
 
         .Example
         PS> Get-SnipeItSupplierByName "Test supplier"
@@ -1804,7 +1822,7 @@ function Get-SnipeItFieldsetByName {
         Required. The name of the fieldset.
 
         .PARAMETER ErrorOnDupe
-        Throw [System.Data.DuplicateNameException] on finding a duplicate name instead of giving a warning.
+        Throw [SnipeItSyncDuplicateNameException] on finding a duplicate name instead of giving a warning.
 
         .PARAMETER NoCache
         Ignore the cache and try to fetch the fieldset directly from Snipe-It.
@@ -1819,7 +1837,7 @@ function Get-SnipeItFieldsetByName {
         The returned snipe-it fieldset.
         
         .Notes
-        Possible custom thrown exceptions (from Get-SnipeItEntityByName): [System.Management.Automation.ValidationMetadataException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        Possible custom thrown exceptions: see get-help Get-SnipeItEntityByName.
 
         .Example
         PS> Get-SnipeItFieldsetByName "PC"
@@ -1870,7 +1888,7 @@ function Get-SnipeItCustomFieldByName {
         Required. The name of the custom field.
 
         .PARAMETER ErrorOnDupe
-        Throw [System.Data.DuplicateNameException] on finding a duplicate name instead of giving a warning.
+        Throw [SnipeItSyncDuplicateNameException] on finding a duplicate name instead of giving a warning.
 
         .PARAMETER NoCache
         Ignore the cache and try to fetch the custom field directly from Snipe-It.
@@ -1887,7 +1905,7 @@ function Get-SnipeItCustomFieldByName {
         .Notes
         You can also get a map of custom fields by calling Get-SnipeItCustomFieldMap.
         
-        Possible custom thrown exceptions (from Get-SnipeItEntityByName): [System.Management.Automation.ValidationMetadataException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        Possible custom thrown exceptions: see get-help Get-SnipeItEntityByName.
 
         .Example
         PS> Get-SnipeItCustomFieldByName "PC"
@@ -1938,7 +1956,7 @@ function Get-SnipeItStatuslabelByName {
         Required. The name of the statuslabel.
 
         .PARAMETER ErrorOnDupe
-        Throw [System.Data.DuplicateNameException] on finding a duplicate name instead of giving a warning.
+        Throw [SnipeItSyncDuplicateNameException] on finding a duplicate name instead of giving a warning.
 
         .PARAMETER NoCache
         Ignore the cache and try to fetch the statuslabel directly from Snipe-It.
@@ -1953,7 +1971,7 @@ function Get-SnipeItStatuslabelByName {
         The returned snipe-it statuslabel.
         
         .Notes
-        Possible custom thrown exceptions (from Get-SnipeItEntityByName): [System.Management.Automation.ValidationMetadataException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        Possible custom thrown exceptions: see get-help Get-SnipeItEntityByName.
 
         .Example
         PS> Get-SnipeItStatuslabelByName "Pending"
@@ -2022,7 +2040,7 @@ function Get-SnipeItModelByName {
         Parameter to be passed to New-SnipeItModel if created.
         
         .PARAMETER ErrorOnDupe
-        Throw [System.Data.DuplicateNameException] on finding a duplicate name instead of giving a warning.
+        Throw [SnipeItSyncDuplicateNameException] on finding a duplicate name instead of giving a warning.
         
         .PARAMETER DontCreateIfNotFound
         Don't create a new snipe-it model if not found. If this switch is not given then -Manufacturer and -Category are required.
@@ -2046,8 +2064,8 @@ function Get-SnipeItModelByName {
         The returned snipe-it model.
         
         .Notes
-        If a new model is to be created, and the manufacturer and category cannot be found or created, [System.Data.ObjectNotFoundException] is thrown.
-        Possible thrown custom exceptions: [System.Data.ObjectNotFoundException], [System.Data.DuplicateNameException], [System.Net.WebException]
+        If a new model is to be created, and the manufacturer and category cannot be found or created, [SnipeItSyncObjectNotFoundException] is thrown.
+        Possible thrown custom exceptions: [SnipeItSyncObjectNotFoundException], [SnipeItSyncDuplicateNameException], [System.Net.WebException]
 
         .Example
         PS> Get-SnipeItModelByName "Latitude 7490" -Manufacturer "Dell, Inc." -Category "PC" -Fieldset "PC"
@@ -2140,31 +2158,31 @@ function Get-SnipeItModelByName {
                 Write-Verbose ("[Get-SnipeItModelByName] {0} results returned for [{1}] with name [{2}], attempting to filter by all given parameters..." -f $sp_entity.Count, $EntityType, $name)
                 $params = @{}
                 if (-Not [string]::IsNullOrEmpty($Manufacturer)) {
+                    $params['manufacturer'] = @{}
                     $id = $Manufacturer -as [int]
                     if ($id -is [int]) {
-                        $params['manufacturer_id'] = $id
+                        $params['manufacturer'].id = $id
                     } else {
-                        $params['manufacturer_<name>'] = $Manufacturer
+                        $params['manufacturer'].name = $Manufacturer
                     }
                 }
                 if (-Not [string]::IsNullOrEmpty($Category)) {
+                    $params['category'] = @{}
                     $id = $Category -as [int]
                     if ($id -is [int]) {
-                        $params['category_id'] = $id
+                        $params['category'].id = $id
                     } else {
-                        $params['category_<name>'] = $Category
+                        $params['category'].name = $Category
                     }
                 }
                 if (-Not [string]::IsNullOrEmpty($Fieldset)) {
+                    $params['fieldset'] = @{}
                     $id = $Fieldset -as [int]
                     if ($id -is [int]) {
-                        $params['fieldset_id'] = $id
+                        $params['fieldset'].id = $id
                     } else {
-                        $params['fieldset_<name>'] = $Fieldset
+                        $params['fieldset'].name = $Fieldset
                     }
-                }
-                if (-Not [string]::IsNullOrEmpty($model_number)) {
-                    $params['model_number'] = $model_number
                 }
                 $sp_entity_tmp = Select-SnipeItFilteredEntity $sp_entity $params -All
                 # Check to see if this results in a better match.
@@ -2186,7 +2204,7 @@ function Get-SnipeItModelByName {
             # Check to see if we still have more than 1 result.
             if ($sp_entity.id.Count -gt 1) {
                 if ($ErrorOnDupe) {
-                    Throw [System.Data.DuplicateNameException] ("[Get-SnipeItModelByName] {0} results returned for [{1}] with name [{2}] and -ErrorOnDupe is set" -f $sp_entity.id.Count, $EntityType, $name)
+                    Throw [SnipeItSyncDuplicateNameException] ("[Get-SnipeItModelByName] {0} results returned for [{1}] with name [{2}] and -ErrorOnDupe is set" -f $sp_entity.id.Count, $EntityType, $name)
                 } else {
                     Write-Warning ("[Get-SnipeItModelByName] {0} results returned for [{1}] with name [{2}], using first result" -f $sp_entity.id.Count, $EntityType, $name)
                     $sp_entity = $sp_entity | Select -First 1
@@ -2211,7 +2229,7 @@ function Get-SnipeItModelByName {
                     # Will throw [System.Net.WebException] if there's a problem with the request
                     $sp_manufacturer_id = (Get-SnipeItManufacturerByName $Manufacturer @pp).id
                     if ($sp_manufacturer_id -isnot [int]) {
-                        Throw [System.Data.ObjectNotFoundException] "[Get-SnipeItModelByName] Got back invalid Manufacturer ID for name [${Manufacturer}]"
+                        Throw [SnipeItSyncObjectNotFoundException] "[Get-SnipeItModelByName] Got back invalid Manufacturer ID for name [${Manufacturer}]"
                     }
                 }
                 $sp_category_id = $Category -as [int]
@@ -2225,7 +2243,7 @@ function Get-SnipeItModelByName {
                     # Will throw [System.Net.WebException] if there's a problem with the request
                     $sp_category_id = (Get-SnipeItCategoryByName $Category @pp).id
                     if ($sp_category_id -isnot [int]) {
-                        Throw [System.Data.ObjectNotFoundException] "[Get-SnipeItModelByName] Got back invalid Category ID for name [${Category}]"
+                        Throw [SnipeItSyncObjectNotFoundException] "[Get-SnipeItModelByName] Got back invalid Category ID for name [${Category}]"
                     }
                 }
                 # Optional parameters
@@ -2318,7 +2336,7 @@ function Get-SnipeItEntityByID {
         The returned snipe-it entity.
         
         .Notes
-        Possible custom thrown exceptions: [System.Management.Automation.ValidationMetadataException], [System.Net.WebException]
+        Possible custom thrown exceptions: [System.ArgumentException], [System.Net.WebException]
 
         .Example
         PS> Get-SnipeItEntityByID 13 "users"
@@ -2393,7 +2411,7 @@ function Get-SnipeItEntityByID {
             }
             default {
                 # Should never get here
-                Throw [System.Management.Automation.ValidationMetadataException] "[Get-SnipeItEntityByName] Unsupported EntityType: $EntityType (should never get here?)"
+                Throw [System.ArgumentException] "[Get-SnipeItEntityByID] Unsupported EntityType: $EntityType (should never get here?)"
             }
         }
         try {
@@ -2410,7 +2428,7 @@ function Get-SnipeItEntityByID {
                 $sp_entity = &$func -id $ID -WarningAction SilentlyContinue
                 if (-Not [string]::IsNullOrWhitespace($sp_entity.StatusCode) -And $sp_entity.StatusCode -in $SNIPEIT_RETRY_ON_STATUS_CODES) {
                     $count_retry--
-                    Write-Warning ("[Get-SnipeItEntityByName] ERROR getting snipeit {0} by ID [{1}]! StatusCode: {2}, StatusDescription: {3}, Retries Left: {4}" -f $EntityType,$ID,$sp_entity.StatusCode,$sp_entity.StatusDescription,$count_retry)
+                    Write-Warning ("[Get-SnipeItEntityByID] ERROR getting snipeit {0} by ID [{1}]! StatusCode: {2}, StatusDescription: {3}, Retries Left: {4}" -f $EntityType,$ID,$sp_entity.StatusCode,$sp_entity.StatusDescription,$count_retry)
                 } else {
                     if ([string]::IsNullOrWhitespace($sp_entity.StatusCode) -And $sp_entity.id -is [int]) {
                         $update_cache = $true
@@ -2422,7 +2440,7 @@ function Get-SnipeItEntityByID {
                 Start-Sleep -Milliseconds $SleepMS
             }
             if (-Not [string]::IsNullOrWhitespace($sp_entity.StatusCode)) {
-                Throw [System.Net.WebException] ("[Get-SnipeItEntityByName] Fatal ERROR getting snipeit {0} with ID [{1}]! StatusCode: {2}, StatusDescription: {3}" -f $EntityType,$ID,$sp_entity.StatusCode,$sp_entity.StatusDescription)
+                Throw [System.Net.WebException] ("[Get-SnipeItEntityByID] Fatal ERROR getting snipeit {0} with ID [{1}]! StatusCode: {2}, StatusDescription: {3}" -f $EntityType,$ID,$sp_entity.StatusCode,$sp_entity.StatusDescription)
             }
             if ($sp_entity.id -is [int]) {
                 $update_cache = $true
@@ -2763,7 +2781,7 @@ function Sync-SnipeItUser {
         Only sync if all the given fields are non-blank. Defaults to requiring a valid department_id. Note that "username", "first_name", and "last_name" must always be non-blank, as well as "employee_num" if -SyncOnEmployeeNum is given.
 
         .PARAMETER SyncOnEmployeeNum
-        Search for users in snipe-it by their employee_num. This is intended to be used with the SID value from AD, but can be used with any unique value. The employee_num field must be non-blank for this to work. If the employee_num field is blank in snipe-it, double-check the username for a match. If we return more than one user this way, throw [System.Data.DuplicateNameException].
+        Search for users in snipe-it by their employee_num. This is intended to be used with the SID value from AD, but can be used with any unique value. The employee_num field must be non-blank for this to work. If the employee_num field is blank in snipe-it, double-check the username for a match. If we return more than one user this way, throw [SnipeItSyncDuplicateNameException].
         
         .PARAMETER OnlyUpdateBlankFields
         Only update the given fields if they are blank in snipe-it. Note that "employee_num" is invalid for this option if -SyncOnEmployeeNum is given.
@@ -2809,9 +2827,9 @@ function Sync-SnipeItUser {
         
         Managers are synced recursively to make sure they exist first. Although the function double-checks if a user is a manager to themselves, if you have a circle in your manager assignments this will result in infinite recursion and a likely crash.
         
-        If a duplicate if found from either username (should never happen) or employee_num, [System.Data.DuplicateNameException] is thrown.
+        If a duplicate if found from either username (should never happen) or employee_num, [SnipeItSyncDuplicateNameException] is thrown.
         
-        Possible custom thrown exceptions: [System.Management.Automation.ValidationMetadataException], [System.Net.WebException], [System.Data.DuplicateNameException]
+        Possible custom thrown exceptions: [System.ArgumentException], [System.Net.WebException], [SnipeItSyncDuplicateNameException]
         
         There are a lot of different possible ways exceptions can be thrown. If you're not using a try/catch block you may need to use -ErrorAction Continue.
         
@@ -2832,7 +2850,7 @@ function Sync-SnipeItUser {
         # Username must always be non-blank (and employee_num must be non-blank IF SyncOnEmployeeNum is set).
         # first_name and last_name are also always required.
         [parameter(Mandatory=$false)]
-        [ValidateSet("employee_num", "email", "password", "phone", "notes", "jobtitle", "activated", "ldap_import", "image", "company_id", "department_id", "location_id", "manager_id")]
+        [ValidateSet("employee_num", "email", "phone", "notes", "jobtitle", "activated", "ldap_import", "image", "company_id", "department_id", "location_id", "manager_id")]
         [AllowEmptyCollection()]
         [string[]]$RequiredSyncFields=@("department_id"),
         
@@ -2924,7 +2942,7 @@ function Sync-SnipeItUser {
                 $user_values[$field] = $User.$field
             }
         } elseif ($SyncOnEmployeeNum) {
-            Throw [System.Management.Automation.ValidationMetadataException] ("[Sync-SnipeItUser] Cannot sync user [{0}] due to missing/blank field [employee_num] with -SyncOnEmployeeNum set" -f $_.username)
+            Throw [System.ArgumentException] ("[Sync-SnipeItUser] Cannot sync user [{0}] due to missing/blank field [employee_num] with -SyncOnEmployeeNum set" -f $_.username)
         } else {
             $props_missing += @($field)
         }
@@ -2945,7 +2963,7 @@ function Sync-SnipeItUser {
         foreach ($field in $_NONREQUIREDFIELDS) {
             if ($field -ne "groups") {
                 if (-Not [string]::IsNullOrEmpty($User.$field)) {
-                    if ($Trim -And $User.$field -is [string] -And $field -ne "password") {
+                    if ($Trim -And $User.$field -is [string]) {
                         $user_values[$field] = $User.$field.Trim()
                     } else {
                         $user_values[$field] = $User.$field
@@ -3116,21 +3134,21 @@ function Sync-SnipeItUser {
             $sp_user = Get-SnipeItUserEx -Username $user_values["username"] -NoCache -OnErrorRetry $OnErrorRetry -SleepMS $SleepMS -DontUpdateCacheIfFound
             if ([string]::IsNullOrWhitespace($sp_user.StatusCode) -And $sp_user.Count -gt 1) {
                 # Should never get here
-                Throw [System.Data.DuplicateNameException] ("[Sync-SnipeItUser] Cannot update user by username - {0} results returned for user [{1}] with SID [{2}] " -f $sp_user.Count, $user_values["username"], $user_values["employee_num"])
+                Throw [SnipeItSyncDuplicateNameException] ("[Sync-SnipeItUser] Cannot update user by username - {0} results returned for user [{1}] with SID [{2}] " -f $sp_user.Count, $user_values["username"], $user_values["employee_num"])
             }
             if ($SyncOnEmployeeNum) {
                 $sp_user2 = Get-SnipeItUserEx -EmployeeNum $user_values["employee_num"] -NoCache -OnErrorRetry $OnErrorRetry -SleepMS $SleepMS -DontUpdateCacheIfFound
                 if ([string]::IsNullOrWhitespace($sp_user2.StatusCode)) {
                     if ($sp_user2.id.Count -gt 1) {
-                        Throw [System.Data.DuplicateNameException] ("[Sync-SnipeItUser] Cannot update user by employee_num - {0} results returned for user [{1}] with SID [{2}] " -f $sp_user2.id.Count, $user_values["username"], $user_values["employee_num"])
+                        Throw [SnipeItSyncDuplicateNameException] ("[Sync-SnipeItUser] Cannot update user by employee_num - {0} results returned for user [{1}] with SID [{2}] " -f $sp_user2.id.Count, $user_values["username"], $user_values["employee_num"])
                     }
                     if ($sp_user2.id -is [int]) {
                         if ([string]::IsNullOrWhitespace($sp_user.StatusCode) -And $sp_user.id -is [int]) {
                             if ([string]::IsNullOrWhitespace($sp_user.employee_num)) {
-                                Throw [System.Data.DuplicateNameException] ("[Sync-SnipeItUser] Cannot update user [{0}] with SID [{1}] due to existing user matching username returned with blank employee_num" -f $user_values["username"],$user_values["employee_num"])
+                                Throw [SnipeItSyncDuplicateNameException] ("[Sync-SnipeItUser] Cannot update user [{0}] with SID [{1}] due to existing user matching username returned with blank employee_num" -f $user_values["username"],$user_values["employee_num"])
                                 return -5
                             } elseif ([System.Net.WebUtility]::HtmlDecode($sp_user.employee_num).Trim() -ne $user_values["employee_num"]) {
-                                Throw [System.Data.DuplicateNameException] ("[Sync-SnipeItUser] Cannot update user [{0}] with SID [{1}] due to existing user matching username with different employee_num" -f $user_values["username"],$user_values["employee_num"])
+                                Throw [SnipeItSyncDuplicateNameException] ("[Sync-SnipeItUser] Cannot update user [{0}] with SID [{1}] due to existing user matching username with different employee_num" -f $user_values["username"],$user_values["employee_num"])
                             }
                         }
                         $sp_user = $sp_user2
@@ -3148,15 +3166,15 @@ function Sync-SnipeItUser {
             if ($SyncOnEployeeNum) {
                 $dupes = $sp_user | Group-Object -Property employee_num -NoElement | where {$_.Count -gt 1}
                 if ($dupes.Count -gt 0) {
-                    Throw [System.Data.DuplicateNameException] ("[Sync-SnipeItUser] Cannot update user [{0}] with employee_num [{1}] due to employee_num matching {2} users and -SyncOnEmployeeNum set" -f $user_values["username"],$user_values["employee_num"],$_.Count)
+                    Throw [SnipeItSyncDuplicateNameException] ("[Sync-SnipeItUser] Cannot update user [{0}] with employee_num [{1}] due to employee_num matching {2} users and -SyncOnEmployeeNum set" -f $user_values["username"],$user_values["employee_num"],$_.Count)
                 }
                 $dupes = $sp_user | where {[string]::IsNullOrWhitespace($_.employee_num) -eq $true}
                 if ($dupes.Count -gt 0) {
-                    Throw [System.Data.DuplicateNameException] ("[Sync-SnipeItUser] Cannot update user [{0}] with SID [{1}] due to existing user matching username returned with blank employee_num" -f $user_values["username"],$user_values["employee_num"])
+                    Throw [SnipeItSyncDuplicateNameException] ("[Sync-SnipeItUser] Cannot update user [{0}] with SID [{1}] due to existing user matching username returned with blank employee_num" -f $user_values["username"],$user_values["employee_num"])
                 }
             }
             # Shouldn't ever get here
-            Throw [System.Data.DuplicateNameException] ("[Sync-SnipeItUser] Cannot update user - {0} results returned for user [{1}] with employee_num [{2}] (shouldn't ever get here)" -f $sp_user.Count, $user_values["username"], $user_values["employee_num"])
+            Throw [SnipeItSyncDuplicateNameException] ("[Sync-SnipeItUser] Cannot update user - {0} results returned for user [{1}] with employee_num [{2}] (shouldn't ever get here)" -f $sp_user.Count, $user_values["username"], $user_values["employee_num"])
         }
         if ($sp_user.id -isnot [int] -And -Not $DontCreateIfNotFound) {
             # Check to see if we need to stop due to missing fields in the user object.
@@ -3193,9 +3211,6 @@ function Sync-SnipeItUser {
             }
             # Generate password if needed.
             if ([string]::IsNullOrEmpty($createParams["password"])) {
-                if (-Not $PSBoundParameters.Debug.IsPresent) {
-                    Write-Verbose("[Sync-SnipeItUser] Generating random password for user [{0}]" -f $user_values["username"])
-                }
                 Add-Type -AssemblyName 'System.Web'
                 $createParams["password"] = [System.Web.Security.Membership]::GeneratePassword(30, 4)
             }
@@ -3226,7 +3241,7 @@ function Sync-SnipeItUser {
             # All attempts failed
             if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode) -Or $sp_user.id -isnot [int]) {
                 if (-Not $PSBoundParameters.Debug.IsPresent) {
-                    Write-Host("[Sync-SnipeItUser] Encountered error with create new user parameters: $createParamsText")
+                    Write-Host("[Sync-SnipeItUser] Encountered error with create new user parameters: " + ($createParams | ConvertTo-Json -Depth 3))
                 }
                 if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode)) {
                     Throw [System.Net.WebException] ("[Sync-SnipeItUser] Fatal ERROR creating snipeit user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $user_values["username"],$sp_user.StatusCode,$sp_user.StatusDescription)
@@ -3262,7 +3277,7 @@ function Sync-SnipeItUser {
             
             # All other fields except notes and groups.
             foreach($field in $_BUILTINFIELDS) {
-                if ($field -ne "notes" -And $field -ne "groups" -And $field -ne "password" -And -Not $updateParams.ContainsKey($field)) {
+                if ($field -ne "notes" -And $field -ne "groups" -And -Not $updateParams.ContainsKey($field)) {
                     $val = $user_values[$field]
                     $spval = $sp_user.$field
                     if ($val -is [string]) {
@@ -3294,10 +3309,6 @@ function Sync-SnipeItUser {
                     $updateParams.Add("groups", $user_values["groups"])
                 }
             }
-            # Update the password, if given.
-            if (-Not [string]::IsNullOrEmpty($user_values["password"])) {
-                $updateParams.Add("password", $user_values["password"])
-            }
             # If we have update parameters, call Set-SnipeitUser.
             if ($updateParams.Count -gt 0) {
                 Write-Verbose ("[Sync-SnipeItUser] User [{0}] (employee_num: [{1}]) requires updates for fields: {2}" -f $sp_user.username,$sp_user.employee_num,($updateParams.Keys -join ", "))
@@ -3308,15 +3319,12 @@ function Sync-SnipeItUser {
                     return $sp_user
                 }
                 
-                # Make sure password is redacted in any logged output
-                # Note -Debug switch may still show password from SnipeitPS's output
-                $updateParamsText = $updateParams.Clone()
-                if ($updateParamsText.ContainsKey("password")) {
-                    $updateParamsText["password"] = '<PASSWORD REDACTED>'
-                }
-                $updateParamsText = $updateParamsText | ConvertTo-Json -Depth 3
-                
                 if (-Not $DebugOutputCreateOnly) {
+                    # Make sure password is redacted in any logged output
+                    # Note -Debug switch may still show password from SnipeitPS's output
+                    $updateParamsText = $updateParams.Clone()
+                    $updateParamsText["password"] = '<PASSWORD REDACTED>'
+                    $updateParamsText = $updateParamsText | ConvertTo-Json -Depth 3
                     Write-Debug("[Sync-SnipeItUser] Update user parameters: $updateParamsText")
                 }
                 
@@ -3352,7 +3360,7 @@ function Sync-SnipeItUser {
                 # All attempts failed
                 if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode) -Or $sp_user.id -isnot [int]) {
                     if (-Not $PSBoundParameters.Debug.IsPresent -Or $DebugOutputCreateOnly) {
-                        Write-Host("[Sync-SnipeItUser] Encountered error with update user parameters: $updateParamsText")
+                        Write-Host("[Sync-SnipeItUser] Encountered error with update user parameters: " + ($updateParams | ConvertTo-Json -Depth 3))
                     }
                     if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode)) {
                         Throw [System.Net.WebException] ("[Sync-SnipeItUser] Fatal ERROR updating snipeit user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $user_values["username"],$sp_user.StatusCode,$sp_user.StatusDescription)
@@ -3694,40 +3702,58 @@ function Sync-SnipeItDeptUsers {
     }
     # Don't wrap this call in try/catch, since we need it -- let it error.
     $sp_depts = Get-SnipeItEntityAll "departments" @pp
-    $sp_users = Get-SnipeItEntityAll "users" -UsersKey "username" @pp
+    #$sp_users = Get-SnipeItEntityAll "users" -UsersKey "username" @pp
         
     # For generating random passwords
     Add-Type -AssemblyName 'System.Web' 
     # Create suffixes and usernames and check to see if they already exist
     # Also check for dupes using Group-Object
-    $sp_depts.Values | where {-Not $SkipEmptyDepartment -Or $_.users_count -gt 0} | Select id,company,location,@{N="Name"; Expression={$_.Name.Trim()}} -ExcludeProperty Name | Select name,id,company,location,@{N="Suffix"; Expression={($_.Name -replace '[^A-Za-z0-9]','').ToLower()}} | where {[string]::IsNullOrEmpty($_.Suffix) -ne $true} | Select name,id,company,location,@{N="Username"; Expression={ $Prefix + '_' + $_.Suffix }} | Group-Object -Property "Username" | foreach {
-        $sp_dept = $_.Group
+    $sp_depts.Values | foreach { $_ } | Select id,company,location,users_count,@{N="Name"; Expression={([System.Net.WebUtility]::HtmlDecode($_.Name)).Trim()}} | Select Name,id,company,location,users_count,@{N="Suffix"; Expression={($_.Name -replace '[^A-Za-z0-9]','').ToLower()}} | where {[string]::IsNullOrEmpty($_.Suffix) -ne $true} | Select Name,id,company,location,users_count,@{N="Username"; Expression={ $Prefix + '_' + $_.Suffix }} | Group-Object -Property "Username" | foreach {
+        $sp_dept = $_.Group | Select -First 1
         if ($_.Count -gt 1) {
             Write-Warning ("[Sync-SnipeItDeptUsers] Departmental username [{0}] matches {2} departments, skipping" -f $_.Name, $_.Count)
+        } elseif ($sp_dept.users_count -eq 0 -And $SkipEmptyDepartment) {
+            Write-Verbose ("[Sync-SnipeItDeptUsers] Skipping empty department [{0}]" -f $_.Name)
         } else {
             $name = $sp_dept.Name
             $username = $sp_dept.Username
             $id = $sp_dept.id
             Write-Verbose ("[Sync-SnipeItDeptUsers] Processing [{0}] department with departmental username [{1}]" -f $name, $username)
             $update_cache = $false
-            if ($sp_dept.id -is [int]) {
+            if ($sp_dept.id -isnot [int]) {
+                Write-Warning ("[Sync-SnipeItDeptUsers] Invalid departmental ID (should never get here)")
+                Write-Debug ("[Sync-SnipeItDeptUsers] Invalid departmental ID (should never get here)")
+            } else {
                 $sp_user = Get-SnipeItUserEx -Username $username @passParams
                 # Username not found, so create it
                 if ($sp_user.id -isnot [int]) { 
+                    Write-Verbose ("[Sync-SnipeItDeptUsers] Username [$username] does not exist and will be created")
+                    # Optionally assign location and company IDs
+                    $createParams = @{
+                       first_name = $name
+                       last_name = $Lastname
+                       username = $username
+                       department_id = $id
+                       activated = $false
+                       password = ([System.Web.Security.Membership]::GeneratePassword(30, 4))
+                    }
+                    if ($SyncLocation -And $sp_dept.location.id -is [int]) {
+                        $createParams.Add("location_id", $sp_dept.location.id)
+                    }
+                    if ($SyncCompany -And $sp_dept.company.id -is [int]) {
+                        $createParams.Add("company_id", $sp_dept.company.id)
+                    }
+                    if ($Notes -is [string]) {
+                        $createParams.Add("notes",$Notes)
+                    }
+                    $createParams_redacted = $createParams.Clone()
+                    $createParams_redacted['password'] = '[PASSWORD REDACTED]'
+                    Write-Debug ("[Sync-SnipeItDeptUsers] New snipe-it user create parameters: " + ($createParams_redacted | ConvertTo-Json -Depth 3))
+                    $createParams_redacted = $null
+                    
                     $count_retry = $OnErrorRetry
                     while ($count_retry -ge 0) {
-                        # Optionally assign location and company IDs
-                        $createParams = @{}
-                        if ($SyncLocation -And $sp_dept.location.id -is [int]) {
-                            $createParams.Add("location_id", $sp_dept.location.id)
-                        }
-                        if ($SyncCompany -And $sp_dept.company.id -is [int]) {
-                            $createParams.Add("location_id", $sp_dept.company.id)
-                        }
-                        if ($Notes -ne $null) {
-                            $createParams.Add("notes",$Notes)
-                        }
-                        $sp_user = New-SnipeitUser -first_name $name -last_name $Lastname -username $username -activated $false -department_id $id -password ([System.Web.Security.Membership]::GeneratePassword(30, 4)) @createParams
+                        $sp_user = New-SnipeitUser @createParams
                         if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode) -And $sp_user.StatusCode -in $SNIPEIT_RETRY_ON_STATUS_CODES) {
                             $count_retry--
                             Write-Warning ("[Sync-SnipeItDeptUsers] ERROR creating snipeit department user [{0}]! StatusCode: {1}, StatusDescription: {2}, Retries Left: {3}" -f $username,$sp_user.StatusCode,$sp_user.StatusDescription,$count_retry)
@@ -3744,10 +3770,8 @@ function Sync-SnipeItDeptUsers {
                     }
                     # All attempts failed
                     if (-Not [string]::IsNullOrWhitespace($sp_user.StatusCode)) {
-                        # Throw [System.Net.WebException] ("[Sync-SnipeItDeptUsers] ERROR creating snipeit departmental user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $username,$sp_user.StatusCode,$sp_user.StatusDescription)
                         Write-Error ("[Sync-SnipeItDeptUsers] ERROR creating snipeit departmental user [{0}]! StatusCode: {1}, StatusDescription: {2}" -f $username,$sp_user.StatusCode,$sp_user.StatusDescription)
                     } elseif ($sp_user.id -isnot [int]) {
-                        # Throw [System.Net.WebException] ("[Sync-SnipeItDeptUsers] ERROR creating snipeit departmental user [{0}]! Returned user has invalid ID" -f $username)
                         Write-Error ("[Sync-SnipeItDeptUsers] ERROR creating snipeit departmental user [{0}]! Returned user has invalid ID" -f $username)
                     }
                 }
@@ -3814,24 +3838,30 @@ function Sync-SnipeItAsset {
         
         The following fields will automatically resolve to their IDs or be created if not found: manufacturer, category, model (only created if manufacturer and category are valid), supplier, company, and location. See Notes for more detail.
         
-        You can give either assigned_to or assigned_id for a user id assignment, but not both.
+        You can give assigned_to to assign a user, asset, or location, where the checkout_to_type field defines what type of assignment: "user" (username),"username","employee_num","user_id","location" (location name),"location_name","location_id","asset" (asset tag),"asset_tag","asset_id","asset_name", or "asset_serial", defaulting to "user".
         
         .PARAMETER SyncFields
         One or more fields to sync. These may be built-in from the Snipe-It API or custom field names. If not given the function tries to compute them from the object property members of type NoteProperty.
-        
-        .PARAMETER UniqueIDField
-        A field which maps to a unique field on the asset, used for displaying in logs. (Default: "Serial")
         
         .PARAMETER SyncOnFieldMap
         A map of fields contained within -SyncFields to try and match and what fields to sync if the given field matches. If given a value of $true, sync all fields defined. This allows you to sync only partial information if you're missing something like Serial Number. This accepts an ordered hashtable, where it will be matched in the order of the keys. Note 'id' and 'asset_tag' will always attempted to be matched first, if they exist.
         
         Example: [ordered]@{ "Serial" = $true; "AD SID" = @("Name", "LastLogonTime", "LastLogonUser", "IPAddress") }
         
+        .PARAMETER UniqueIDField
+        A field which maps to a unique field on the asset, used for displaying in logs. (Default: "Serial")
+        
+        .PARAMETER DontSyncOnAssetTag
+        Do not search Snipe-It by the asset's asset_tag field (enabled by default). This allows updating asset tags using another unique field, like Serial #.
+        
         .PARAMETER RequiredCreateFields
         One or more fields which must be non-blank before the asset is created. Defaults to @("Name","Serial").
         
         .PARAMETER OnlyUpdateBlankFields
         Only update the given fields if they are blank in snipe-it, instead of overwriting existing values.
+                
+        .Parameter ErrorOnMissingFields
+        Throw an error if required fields for creating an asset are missing. Default behavior is to output to Write-Verbose.
         
         .PARAMETER DefaultModel
         A default model name to lookup if the given asset's model and model_id fields are both blank or not found. Note this will never overwrite data already in Snipe-It.
@@ -3842,11 +3872,26 @@ function Sync-SnipeItAsset {
         .PARAMETER DefaultCreateStatus
         Default status or status ID when creating assets. This must equate to a valid status. Defaults to 2.
         
+        .PARAMETER DefaultAssignedStatus
+        Default status or status ID when assigning assets. This must equate to a valid status. Defaults to 1.
+        
         .PARAMETER UpdateArchivedStatus
         Change archived assets to the given status if found when syncing, otherwise display a warning.
 
+        .PARAMETER AllowAssignNonDeployableStatus
+        Attempt to assign an asset even when it's in an otherwise non-deployable status.
+        
         .PARAMETER DontCreateIfNotFound
         Don't create any assets if not found, only update existing assets.
+        
+        .PARAMETER DontCreateModelIfNotFound
+        Don't create any new models if given but not found.
+        
+        .PARAMETER DontCreateCategoryIfNotFound
+        Don't create any new categories when creating new models.
+        
+        .PARAMETER DontCreateManufacturerIfNotFound
+        Don't create any new manufacturers when creating new models.
         
         .PARAMETER DontCreateCompanyIfNotFound
         Don't create any new companies if given but not found.
@@ -3859,6 +3904,9 @@ function Sync-SnipeItAsset {
         
         .PARAMETER DebugOutputCreateOnly
         Only give debug output when creating new assets.
+        
+        .PARAMETER DateFormat
+        Automatically convert custom date fields into the format required by Snipe-It (yyyy-MM-dd). Give $null to disable.
         
         .PARAMETER Trim
         Trim all strings, instead of just proper names.
@@ -3878,11 +3926,11 @@ function Sync-SnipeItAsset {
         .Notes
         Returns the processed asset from snipe-it (whether or not it was updated).
         
-        [System.Data.DuplicateNameException] is thrown on duplicates.
+        [SnipeItSyncDuplicateNameException] is thrown on duplicates.
         
-        If a required entity is not found and cannot be created (statuslabel, model, etc.), [System.Data.ObjectNotFoundException] is thrown.
+        If a required entity is not found and cannot be created (statuslabel, model, etc.), [SnipeItSyncObjectNotFoundException] is thrown.
         
-        Possible custom thrown exceptions: [System.Net.WebException], [System.Data.ObjectNotFoundException], [System.Data.DuplicateNameException]
+        Possible custom thrown exceptions: [System.Net.WebException], [SnipeItSyncObjectNotFoundException], [SnipeItSyncDuplicateNameException]
 
         If an asset custom value is a hashtable, assume the field is a checkbox and compute the hashtable values as: $true (add if not present), $false (remove if present), or missing/$null (ignore existing value if present). An example would be where the existing value is "Foo, Bar" and the new values is @{ "Foo"=$false }, the result would be "Bar".
         
@@ -3917,6 +3965,9 @@ function Sync-SnipeItAsset {
         [System.Collections.IDictionary]$SyncOnFieldMap=@{ "Serial" = $true },
         
         [parameter(Mandatory=$false)]
+        [switch]$DontSyncOnAssetTag,
+        
+        [parameter(Mandatory=$false)]
         [string]$UniqueIDField = "Serial",
         
         [parameter(Mandatory=$false)]
@@ -3925,6 +3976,9 @@ function Sync-SnipeItAsset {
         [parameter(Mandatory=$false)]
         [AllowEmptyCollection()]
         [string[]]$OnlyUpdateBlankFields,
+        
+        [parameter(Mandatory=$false)]
+        [switch]$ErrorOnMissingFields,
         
         [parameter(Mandatory=$false)]
         [string]$DefaultModel,
@@ -3936,11 +3990,26 @@ function Sync-SnipeItAsset {
         [string]$DefaultCreateStatus = "2",
         
         [parameter(Mandatory=$false)]
+        [string]$DefaultAssignedStatus = "1",
+        
+        [parameter(Mandatory=$false)]
         [string]$UpdateArchivedStatus,
-
+        
+        [parameter(Mandatory=$false)]
+        [switch]$AllowAssignNonDeployableStatus,
+        
         [parameter(Mandatory=$false)]
         [switch]$DontCreateIfNotFound,
 
+        [parameter(Mandatory=$false)]
+        [switch]$DontCreateModelIfNotFound,
+        
+        [parameter(Mandatory=$false)]
+        [switch]$DontCreateCategoryIfNotFound,
+        
+        [parameter(Mandatory=$false)]
+        [switch]$DontCreateManufacturerIfNotFound,
+        
         [parameter(Mandatory=$false)]
         [switch]$DontCreateCompanyIfNotFound,
 
@@ -3952,7 +4021,11 @@ function Sync-SnipeItAsset {
         
         [parameter(Mandatory=$false)]
         [switch]$DebugOutputCreateOnly,
-
+        
+        [parameter(Mandatory=$false)]
+        [AllowNull()]
+        [string]$DateFormat='yyyy-MM-dd',
+        
         [parameter(Mandatory=$false)]
         [switch]$Trim,
         
@@ -3970,15 +4043,15 @@ function Sync-SnipeItAsset {
     Begin {
         # Anything other than the fields below are considered custom fields
         $_UPDATEFIELDS = @("asset_tag","serial","name","notes","order_number","warranty_months","purchase_cost","purchase_date","requestable","archived","url","image","image_delete")
-        $_CREATEFIELDS = @("asset_tag","serial","name","notes","order_number","warranty_months","purchase_cost","purchase_date","requestable","url","checkout_to_type")
-        $_SPECIALFIELDS = @("id","customfields","assigned_to","assigned_id","status","status_id","company","location_id","Location","rtd_location_id","model","model_id","modelnumber","manufacturer","manufacturer_id","category","category_id","fieldset","fieldset_id","location_address","location_address2","location_city","location_state","location_country","location_zip","location_currency","location_parent_id","location_manager_id","location_ldap_ou","location_image","supplier","supplier_id","supplier_address","supplier_address2","supplier_city","supplier_state","supplier_country","supplier_zip","supplier_phone","supplier_fax","supplier_email","supplier_contact","supplier_notes","supplier_image")
+        $_CREATEFIELDS = @("asset_tag","serial","name","notes","order_number","warranty_months","purchase_cost","purchase_date","requestable","url")
+        $_SPECIALFIELDS = @("id","customfields","assigned_to","assigned_id","checkout_to_type","status","status_id","company","location_id","Location","rtd_location_id","model","model_id","modelnumber","manufacturer","manufacturer_id","category","category_id","fieldset","fieldset_id","location_address","location_address2","location_city","location_state","location_country","location_zip","location_currency","location_parent_id","location_manager_id","location_ldap_ou","location_image","supplier","supplier_id","supplier_address","supplier_address2","supplier_city","supplier_state","supplier_country","supplier_zip","supplier_phone","supplier_fax","supplier_email","supplier_contact","supplier_notes","supplier_image")
         
         $_ALLBUILTINFIELDS = ($_UPDATEFIELDS + $_CREATEFIELDS + $_SPECIALFIELDS) | Select -Unique
 
         # Get list of fields to Sync if not in parameters
         if ($SyncFields.Count -gt 0) {
             $_syncFields = $SyncFields
-        } elseif ($Asset -is [System.Collection.IDictionary] -Or $Asset -is [hashtable]) {
+        } elseif ($Asset -is [System.Collections.IDictionary] -Or $Asset -is [hashtable]) {
             $_syncFields = $Asset.Keys
         } else {
             $_syncFields = $Asset | Get-Member -MemberType NoteProperty | Select -ExpandProperty Name | Out-String -Stream
@@ -4001,7 +4074,7 @@ function Sync-SnipeItAsset {
             }
         }
         # Add 'id' and 'asset_tag', if they don't already exist
-        if (-Not $_syncOnFieldMap.Contains('id')) {
+        if (-Not $_syncOnFieldMap.Contains('asset_tag') -And -Not $DontSyncOnAssetTag) {
             $_syncOnFieldMap.Insert(0, 'asset_tag', $true)
         }
         if (-Not $_syncOnFieldMap.Contains('id')) {
@@ -4048,8 +4121,10 @@ function Sync-SnipeItAsset {
         if ($sp_model.id -isnot [int] -And -Not [string]::IsNullOrWhitespace($model)) {
             # Make create parameters in case we need them.
             $createParams = $passParams.Clone()
-            # Add Category and Manufacturer if they both exist, otherwise don't create model if either doesn't exist
-            If (-Not [string]::IsNullOrWhitespace($Asset.Category) -And -Not [string]::IsNullOrWhitespace($Asset.Manufacturer)) {
+            if ($DontCreateModelIfNotFound) {
+                $createParams.Add("DontCreateIfNotFound", $true)
+            } elseif (-Not [string]::IsNullOrWhitespace($Asset.Category) -And -Not [string]::IsNullOrWhitespace($Asset.Manufacturer)) {
+                # Add Category and Manufacturer if they both exist, otherwise don't create model if either doesn't exist
                 $createParams.Add("Category", $Asset.Category)
                 $createParams.Add("Manufacturer", $Asset.Manufacturer)
             } else {
@@ -4068,18 +4143,26 @@ function Sync-SnipeItAsset {
             if (-Not [string]::IsNullOrEmpty($Asset.ModelNumber)) {
                 $createParams.Add("ModelNumber", $Asset.ModelNumber)
             }
-            # Will create if not exist.
+            # Additional parameters.
+            if ($DontCreateCategoryIfNotFound) {
+                $createParams.Add("DontCreateCategoryIfNotFound", $true)
+            }
+            if ($DontCreateManufacturerIfNotFound) {
+                $createParams.Add("DontCreateManufacturerIfNotFound", $true)
+            }
+
+            # Will create if needed unless -DontCreateModelIfNotFound is given.
             $sp_model = Get-SnipeItModelByName $model @createParams
         }
         # If we don't have a valid model, check if we have a DefaultModel to use
-        $using_default_model = $false
+        $usingDefaultModel = $false
         if ($sp_model.id -isnot [int] -And -Not [string]::IsNullOrWhitespace($DefaultModel)) {
             # Category and manaufacturer are required, but ignored with -DontCreateIfNotFound
             $sp_model = Get-SnipeItModelByName $DefaultModel @passParams -DontCreateIfNotFound
             if ($sp_model.id -isnot [int]) {
                 Write-Warning "[Sync-SnipeItAsset] [$UniqueID] Model [$model] and default model [$DefaultModel] both returned no valid ID"
             } else {
-                $using_default_model = $true
+                $usingDefaultModel = $true
                 Write-Verbose ("[Sync-SnipeItAsset] [$UniqueID] Model [$model] not found, using default model [$DefaultModel] with model_id [{0}]" -f $sp_model.id)
             }
         }
@@ -4172,6 +4255,7 @@ function Sync-SnipeItAsset {
 
         # Check to make sure we have a valid status ID for creating or updating
         $status_id = $Asset.status_id
+        $status = $null
         if ($status_id -ne $null) {
             $status_id = ($status_id -as [int])
             if ($status_id -isnot [int]) {
@@ -4179,9 +4263,12 @@ function Sync-SnipeItAsset {
             }
         }
         if ($status_id -isnot [int] -And -Not [string]::IsNullOrWhitespace($Asset.status)) {
-            $status_id = (Get-SnipeItStatusLabelByName $Asset.status @passParams).id
+            $status = Get-SnipeItStatusLabelByName $Asset.status @passParams
+            $status_id = $status.id
             if ($status_id -isnot [int]) {
                 Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Invalid status [{0}]" -f $Asset.status)
+                $status = $null
+                $status_id = $null
             }
         }
         
@@ -4263,16 +4350,111 @@ function Sync-SnipeItAsset {
             }
             
             # Add assigned_id / assigned_to, if it exists
+            $checkout_to_type = $null
             $assigned_id = $null
-            if ($Asset.assigned_id -is [int]) {
-                if ($Asset.assigned_to -is [int]) {
-                    Write-Warning("[Sync-SnipeItAsset] Cannot sync assigned_id / assigned_to when both are valid numbers")
-                } else {
-                    $assigned_id = $Asset.assigned_id
+            if (-Not [string]::IsNullOrEmpty($Asset.assigned_to) -Or -Not [string]::IsNullOrEmpty($Asset.assigned_id)) {
+                $_assigned = $Asset.assigned_to
+                if ([string]::IsNullOrEmpty($_assigned)) {
+                    $_assigned = $Asset.assigned_id
                 }
-            }
-            if ($assigned_id -isnot [int] -And $Asset.assigned_to -is [int]) {
-                $assigned_id = $Asset.assigned_to
+                if (-Not [string]::IsNullOrEmpty($Asset.checkout_to_type) -And $Asset.checkout_to_type -notin @("user","username","employee_num","user_id","location","location_name","location_id","asset","asset_tag","asset_id","asset_name","asset_serial")) {
+                    Write-Warning("[Sync-SnipeItAsset] Cannot sync assigned_to: Invalid checkout_to_type [{0}]" -f $Asset.checkout_to_type)
+                } else {
+                    switch($Asset.checkout_to_type) {
+                        {$_ -in 'location','location_name'} {
+                            $result = Get-SnipeItLocationByName $_assigned -DontCreateIfNotFound
+                            if ([string]::IsNullOrWhitespace($result.StatusCode) -And $result.id -is [int] -And $result.id.Count -lt 2) {
+                                $assigned_id = $result.id
+                                $checkout_to_type = 'location'
+                            } elseif ($result.id.Count -gt 1) {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot sync assigned_to with location [{0}] - multiple results returned" -f $_assigned)
+                            } else {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot sync assigned_to with location [{0}] - does not exist" -f $_assigned)
+                            }
+                        }
+                        'location_id' {
+                            $result = Get-SnipeItEntityByID "locations" $_assigned @passParams
+                            if ([string]::IsNullOrWhitespace($result.StatusCode) -And $result.id -is [int]) {
+                                $assigned_id = $result.id
+                                $checkout_to_type = 'location'
+                            } else {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot sync assigned_to with location ID [{0}] - does not exist" -f $_assigned)
+                            }
+                        }
+                        {$_ -in 'asset_tag','asset'} {
+                            $result = Get-SnipeItAssetEx -AssetTag $_assigned @passParams
+                            if ([string]::IsNullOrWhitespace($result.StatusCode) -And $result.id -is [int]) {
+                                $assigned_id  = $result.id
+                                $checkout_to_type = 'asset'
+                            } else {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] assigned_to with asset tag [{0}] - does not exist" -f $_assigned)
+                            }
+                        }
+                        'asset_id' {
+                            $result = Get-SnipeItEntityByID "assets" $_assigned @passParams
+                            if ([string]::IsNullOrWhitespace($result.StatusCode) -And $result.id -is [int]) {
+                                $assigned_id = $result.id
+                                $checkout_to_type = 'asset'
+                            } else {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot sync assigned_to with asset ID [{0}] - does not exist" -f $_assigned)
+                            }
+                        }
+                        'asset_serial' {
+                            $result = Get-SnipeItAssetEx -Serial $_assigned @passParams
+                            if ([string]::IsNullOrWhitespace($result.StatusCode) -And $result.id -is [int] -And $result.id.Count -lt 2) {
+                                $assigned_id  = $result.id
+                                $checkout_to_type = 'asset'
+                            } elseif ($result.id.Count -gt 1) {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot sync assigned_to with asset serial # [{0}] - multiple results returned" -f $_assigned)
+                            } else {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot sync assigned_to with asset serial # [{0}] - does not exist" -f $_assigned)
+                            }
+                        }
+                        'asset_name' {
+                            $result = Get-SnipeItAssetEx -Name $_assigned @passParams
+                            if ([string]::IsNullOrWhitespace($result.StatusCode) -And $result.id -is [int] -And $result.id.Count -lt 2) {
+                                $assigned_id  = $result.id
+                                $checkout_to_type = 'asset'
+                            } elseif ($result.id.Count -gt 1) {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot sync assigned_to with asset name [{0}] - multiple results returned" -f $_assigned)
+                            } else {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot sync assigned_to with asset name [{0}] - does not exist" -f $_assigned)
+                            }
+                        }
+                        'user_id' {
+                            $result = Get-SnipeItEntityByID "users" $_assigned @passParams
+                            if ([string]::IsNullOrWhitespace($result.StatusCode) -And $result.id -is [int]) {
+                                $assigned_id = $result.id
+                                $checkout_to_type = 'user'
+                            } else {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot sync assigned_to with snipe-it user ID [{0}] - does not exist" -f $_assigned)
+                            }
+                        }
+                        'employee_num' {
+                            $result = Get-SnipeItUserEx -EmployeeNum $_assigned @passParams
+                            if ([string]::IsNullOrWhitespace($result.StatusCode) -And $result.id -is [int] -And $result.id.Count -lt 2) {
+                                $assigned_id = $result.id
+                                $checkout_to_type = 'user'
+                            } elseif ($result.id.Count -gt 1) {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot sync assigned_to with employee_num [{0}] - multiple results returned" -f $_assigned)
+                            } else {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot sync assigned_to with employee_num [{0}] - does not exist" -f $_assigned)
+                            }
+                        }
+                        default {
+                            $result = Get-SnipeItUserEx -Username $_assigned @passParams
+                            if ([string]::IsNullOrWhitespace($result.StatusCode) -And $result.id -is [int]) {
+                                $assigned_id = $result.id
+                                $checkout_to_type = 'user'
+                                if ([string]::IsNullOrEmpty($Asset.checkout_to_type)) {
+                                    Write-Debug("[Sync-SnipeItAsset] [$UniqueID] checkout_to_type is blank, assuming type [$checkout_to_type]")
+                                }
+                            } else {
+                                Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot sync assigned_to with username [{0}] - does not exist" -f $_assigned)
+                            }
+                        }
+                    }
+                }
             }
         }
             
@@ -4286,26 +4468,85 @@ function Sync-SnipeItAsset {
                 
                 # First check to make sure we have a valid model ID.
                 if ($sp_model.id -isnot [int]) {
-                    Write-Warning "[Sync-SnipeItAsset] [$UniqueID] Cannot create asset due to invalid or missing model/model ID"
-                    # return early
+                    $msg = "[Sync-SnipeItAsset] [$UniqueID] Cannot create asset due to invalid or missing model [$model]/model ID [$model_id]"
+                    if ($ErrorOnMissingFields) {    
+                        Throw [SnipeItSyncValidationException] $msg
+                    } else {
+                        Write-Warning $msg
+                    }
                     return
                 }
-                # Also check we have a valid status_id to use.
+                
+                # Check to see if we need to have and need to use -DefaultCreateStatus.
+                $usingDefaultStatus = $null
                 if ($status_id -isnot [int]) {
                     $status_id = ($DefaultCreateStatus -as [int])
                     if ($status_id -isnot [int]) {
-                        $status_id = (Get-SnipeItStatusLabelByName $DefaultCreateStatus @passParams).id
-                        if ($status_id -isnot [int]) {
-                            Throw [System.Data.ObjectNotFoundException] "[Sync-SnipeItAsset] [$UniqueID] Cannot create asset due to no valid [status_id] defined and -DefaultCreateStatus having invalid or missing status [$DefaultCreateStatus]"
+                        $status = Get-SnipeItStatusLabelByName $DefaultCreateStatus @passParams
+                        if ($status.id -is [int]) {
+                            $status_id = $status.id
+                            $usingDefaultStatus = $true
+                        }
+                    } else {
+                        $usingDefaultStatus = $true
+                    }
+                }
+                
+                # Make sure we have a valid status_id/status to use when assigning, and fetch the status_type if needed.
+                # Valid status types must be of status_type 'deployable' unless -AllowAssignNonDeployableStatus is given.
+                if ($assigned_id -is [int]) {
+                    if ($status_id -is [int] -And $status.id -isnot [int]) {
+                        $status = Get-SnipeItEntityByID $status_id "statuslabels" @passParams
+                        if ($status.id -isnot [int]) {
+                            if ($usingDefaultStatus) {
+                                Throw [SnipeItSyncObjectNotFoundException] ("[Sync-SnipeItAsset] [$UniqueID] Invalid or unknown status ID from -DefaultCreateStatus: $status_id")
+                            } else {
+                                Throw [SnipeItSyncObjectNotFoundException] ("[Sync-SnipeItAsset] [$UniqueID] Invalid or unknown status ID: $status_id")
+                            }
                         }
                     }
+                    # We have no valid status, or we are using the status from DefaultCreateStatus with DefaultAssignedStatus also being set.
+                    if (($status.id -isnot [int] -Or $usingDefaultStatus) -And -Not [string]::IsNullOrEmpty($DefaultAssignedStatus)) {
+                        # Check to see if we have a valid DefaultAssignedStatus.
+                        $status_id = ($DefaultAssignedStatus -as [int])
+                        if ($status_id -is [int]) {
+                            $status = Get-SnipeItEntityByID $status_id "statuslabels" @passParams
+                            if ($status.id -isnot [int]) {
+                                Throw [SnipeItSyncObjectNotFoundException] ("[Sync-SnipeItAsset] [$UniqueID] Invalid or unknown status ID [$DefaultAssignedStatus] set for -DefaultAssignedStatus")
+                            } else {
+                                $usingDefaultStatus = $true
+                            }
+                        } else {
+                            $status_id = $null
+                            # Try to lookup by name.
+                            $status = Get-SnipeItStatusLabelByName $DefaultAssignedStatus @passParams
+                            if ($status.id -isnot [int]) {
+                                Throw [SnipeItSyncObjectNotFoundException] ("[Sync-SnipeItAsset] [$UniqueID] Invalid or unknown status [$DefaultAssignedStatus] set for -DefaultAssignedStatus")
+                            } else {
+                                $status_id = $status.id
+                                $usingDefaultStatus = $true
+                            }
+                        }
+                        if ($status.type -ne 'deployable' -And -Not $AllowAssignNonDeployableStatus) {
+                            Throw [SnipeItSyncValidationException] ("[Sync-SnipeItAsset] [$UniqueID] Assignment of [{0}] given, but given -DefaultAssignedStatus [{1}] (ID: {2}) is non-deployable type [{3}]" -f $assigned_id, $status.name, $status.id, $status.type)
+                        }
+                    }
+                    
+                    # All attempts to get a valid status ID have failed.
+                    if ($status_id -isnot [int]) {
+                        Throw [SnipeItSyncValidationException] "[Sync-SnipeItAsset] [$UniqueID] Cannot create asset due to no valid [status_id] or [status] defined and -DefaultAssignedStatus having invalid or missing status [$DefaultAssignedStatus]"
+                    } elseif ($status.type -ne 'deployable' -And -Not $AllowAssignNonDeployableStatus) {
+                        Throw [SnipeItSyncValidationException] ("[Sync-SnipeItAsset] [$UniqueID] Assignment of [{0}] given, but given status [{1}] (ID: {2}) is non-deployable type [{3}]" -f $assigned_id, $status.name, $status.id, $status.type)
+                    }
+                }
+                if ($status_id -isnot [int]) {
+                    Throw [SnipeItSyncValidationException] "[Sync-SnipeItAsset] [$UniqueID] Cannot create asset due to no valid [status_id] or [status] defined and -DefaultCreateStatus having invalid or missing status [$DefaultCreateStatus]"
                 }
             
                 # Fill out create parameters.
                 $createParams = @{}
                 $createCustomFields = @{}
                 $createFields = @()
-                $createAllowed = $false
                 $unknownFields = @()
                 foreach ($field in $_syncFields) {
                     if (-Not [string]::IsNullOrEmpty($field)) {
@@ -4328,62 +4569,85 @@ function Sync-SnipeItAsset {
                                 } else {
                                     # Assumed to be a checkbox field if hashtable.
                                     if ($val -is [hashtable]) {
-                                        $createCustomFields.Add($dbfield, ($val.GetEnumerator() | where {$_.Value -eq $true} | Select -ExpandProperty Name) -join ", ")
-                                    } else {
-                                        $createCustomFields.Add($dbfield, $val)
+                                        $val = ($val.GetEnumerator() | where {$_.Value -eq $true} | Select -ExpandProperty Name) -join ', '
+                                    # DATE Format field
+                                    } elseif (($fieldMap[$field]).format -eq 'DATE' -And $DateFormat -is [string]) {
+                                        $val_dt = $val -as [DateTime]
+                                        if ($val_dt -isnot [DateTime]) {
+                                            Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Field [$field] appears to be DATE but given value [$val] cannot be converted to datetime, skipping conversion")
+                                        } else {
+                                            $val = $val_dt.ToString($DateFormat)
+                                        }
                                     }
+                                    $createCustomFields.Add($dbfield, $val)
                                     $createFields += @($field)
                                 }
                             }
                         }
                     }
                 }
+                
+                # Add custom fields
+                if ($createCustomFields.Count -gt 0) {
+                    $createParams.Add("customfields", $createCustomFields)
+                }
+                # Add Model ID
+                if (-Not $createParams.ContainsKey("model_id")) {
+                    $createParams.Add("model_id", $sp_model.id)
+                    if (-Not $usingDefaultModel) {
+                        $createFields += @("model_id","model","manufacturer_id","manufacturer","category_id","category")
+                    }
+                }
+                # Add Status ID
+                if (-Not $createParams.ContainsKey("status_id")) {
+                    $createParams.Add("status_id", $status_id)
+                    if (-Not $usingDefaultStatus) {
+                        $createFields += @("status_id","status")
+                    }
+                }
+                # Add Company ID, if valid
+                if ($company_id -is [int] -And -Not $createParams.ContainsKey("company_id")) {
+                    $createParams.Add("company_id", $company_id)
+                    $createFields += @("company_id","company")
+                }
+                # Add Location ID, if valid
+                if ($location_id -is [int] -And -Not $createParams.ContainsKey("rtd_location_id")) {
+                    $createParams.Add("rtd_location_id", $location_id)
+                    $createFields += @("location_id","rtd_location_id","location")
+                }
+                # Add Supplier ID, if valid
+                if ($supplier_id -is [int] -And -Not $createParams.ContainsKey("supplier_id")) {
+                    $createParams.Add("supplier_id", $supplier_id)
+                    $createFields += @("supplier_id","supplier")
+                }
+                # Add assigned_id, if it exists.
+                if ($assigned_id -is [int] -And -Not $createParams.ContainsKey("assigned_id") -And $checkout_to_type -ne $null) {
+                    $createParams.Add("assigned_id", $assigned_id)
+                    $createFields += @("assigned_id","assigned_to")
+                    if (-Not $createParams.ContainsKey("checkout_to_type")) {
+                        $createParams.Add("checkout_to_type", $checkout_to_type)
+                        $createFields += @("checkout_to_type")
+                    }
+                }
+                # Add Default Create Notes
+                if (-Not $createParams.ContainsKey("notes")) {
+                    $createParams.Add("notes", $DefaultCreateNotes)
+                    $createFields += @("notes")
+                }
+
                 # Check to see if we're missing any required fields
                 $diff = $RequiredCreateFields | where {$createFields -notcontains $_}
                 if ($diff.Count -gt 0) {
-                    Write-Verbose("[Sync-SnipeItAsset] [$UniqueID] Not creating new asset due to missing fields: " + ($diff -join ", "))
+                    $msg = "[Sync-SnipeItAsset] [$UniqueID] Not creating new asset due to missing fields: " + ($diff -join ", ")
+                    if ($ErrorOnMissingFields) {    
+                        Throw [SnipeItSyncValidationException] $msg
+                    } else {
+                        Write-Verbose $msg
+                    }
                 } elseif ($createParams.Count -eq 0 -And $createCustomFields.Count -eq 0) {
                     Write-Verbose("[Sync-SnipeItAsset] [$UniqueID] Asset creation would result in no valid fields, skipping")
                 } else {
-                    # Add custom fields
-                    if ($createCustomFields.Count -gt 0) {
-                        $createParams.Add("customfields", $createCustomFields)
-                    }
-                    # Add Model ID
-                    if (-Not $createParams.ContainsKey("model_id")) {
-                        $createParams.Add("model_id", $sp_model.id)
-                        $createFields += @("model_id")
-                    }
-                    # Add Status ID
-                    if (-Not $createParams.ContainsKey("status_id")) {
-                        $createParams.Add("status_id", $status_id)
-                        $createFields += @("status_id")
-                    }
-                    # Add Company ID, if valid
-                    if ($company_id -is [int] -And -Not $createParams.ContainsKey("company_id")) {
-                        $createParams.Add("company_id", $company_id)
-                        $createFields += @("company_id")
-                    }
-                    # Add Location ID, if valid
-                    if ($location_id -is [int] -And -Not $createParams.ContainsKey("rtd_location_id")) {
-                        $createParams.Add("rtd_location_id", $location_id)
-                        $createFields += @("location_id")
-                    }
-                    # Add Supplier ID, if valid
-                    if ($supplier_id -is [int] -And -Not $createParams.ContainsKey("supplier_id")) {
-                        $createParams.Add("supplier_id", $supplier_id)
-                        $createFields += @("supplier_id")
-                    }
-                    # Add assigned_id, if it exists.
-                    if ($assigned_id -is [int] -And -Not $createParams.ContainsKey("assigned_id")) {
-                        $createParams.Add("assigned_id", $assigned_id)
-                        $createFields += @("assigned_id")
-                    }
-                    # Add Default Create Notes
-                    if (-Not $createParams.ContainsKey("notes")) {
-                        $createParams.Add("notes", $DefaultCreateNotes)
-                        $createFields += @("notes")
-                    }
+
                     # Do we have any unknown fields from $_syncFields?
                     if ($unknownFields.Count -gt 0) {
                         Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot find the following fields in the current fieldset: " + ($unknownFields -join ", "))
@@ -4411,9 +4675,9 @@ function Sync-SnipeItAsset {
                             Write-Host("[Sync-SnipeItAsset] Encountered error with create asset parameters: " + ($createParams | ConvertTo-Json -Depth 3))
                         }
                         if (-Not [string]::IsNullOrWhitespace($sp_asset.StatusCode)) {
-                            Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by: {1})! StatusCode: {2}, StatusDescription: {3}" -f $UniqueID,$matchfield,$sp_asset.StatusCode,$sp_asset.StatusDescription)
+                            Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}]! StatusCode: {2}, StatusDescription: {3}" -f $UniqueID,$sp_asset.StatusCode,$sp_asset.StatusDescription)
                         } elseif ($sp_asset.id -isnot [int]) {
-                            Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by: {1})! Returned asset has invalid ID" -f $UniqueID,$matchfield)
+                            Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}]! Returned asset has invalid ID [{1}]" -f $UniqueID, $sp_asset.id)
                         }
                     } else {
                          Write-Verbose ("[Sync-SnipeItAsset] [$UniqueID] Created new snipe-it asset (ID: {0}) with fields: {1}" -f $sp_asset.id,($createFields -join ", "))
@@ -4448,13 +4712,22 @@ function Sync-SnipeItAsset {
                             $spval = $sp_asset.$field
                             if ([string]::IsNullOrEmpty($spval) -Or -Not $_onlyUpdateBlankFieldsMap[$field]) {
                                 # Check to see if it's in date format and if so, cast to compare.
-                                if ($spval.date -ne $null -Or $spval.datetime -ne $null) {
-                                    $spval_dt = $sp_asset.$field.formatted -as [DateTime]
+                                if ($spval.date -ne $null -Or $spval.datetime -ne $null -Or ($fieldMap[$field]).format -eq 'DATE') {
+                                    if ($spval -ne $null) {
+                                        $spval_dt = $sp_asset.$field.formatted -as [DateTime]
+                                    } else {
+                                        $spval_dt = $null
+                                    }
                                     $val_dt = $val -as [DateTime]
-                                    if ($val_dt -eq $spval_dt) {
-                                         # No update needed
-                                         $val = $null
-                                     }
+                                    if ($val_dt -isnot [DateTime]) {
+                                        Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Field [$field] appears to be DATE but given value [$val] cannot be converted to datetime, skipping field")
+                                    } elseif ($val_dt -eq $spval_dt) {
+                                        # No update needed
+                                        $val = $null
+                                    } elseif ($DateFormat -is [string]) {
+                                        # Convert to DateFormat, if given.
+                                        $val = $val_dt.ToString($DateFormat)
+                                    }
                                 } else {
                                     if ($spval -is [string]) {
                                         $spval = [System.Net.WebUtility]::HtmlDecode($spval)
@@ -4491,7 +4764,7 @@ function Sync-SnipeItAsset {
                                         # Get difference of current values.
                                         # Hashtable values can be either $true (add if not present), $false (remove if present), or missing/$null (ignore if present).
                                         # First, convert the existing string data to an array.
-                                        $spval = ([System.Net.WebUtility]::HtmlDecode($spval) -split ", ")
+                                        $spval = ([System.Net.WebUtility]::HtmlDecode($spval) -split ', ')
                                         # Do an effective outer join of the two arrays on value -ne $false.
                                         $val = ($val.Keys + $spval) | Select -Unique | where {-Not [string]::IsNullOrWhitespace($_) -And $val[$_] -ne $false}
                                         if ($val.Count -eq 0) {
@@ -4546,35 +4819,83 @@ function Sync-SnipeItAsset {
                 $updateParams.Add("company_id", $company_id)
                 $fieldsToUpdate += @("company_id")
             }
-            # Do we have need to update the status ID?
-            if ($status_id -is [int] -And $sp_asset.status_label.id -ne $status_id) {
-                $updateParams.Add("status_id", $status_id)
-                $fieldsToUpdate += @("status_id")
-            } elseif ($sp_asset.status_label.status_type -eq 'archived') {
-                # For archived assets, check if $UpdateArchivedStatus is set
-                if (-Not [string]::IsNullOrWhitespace($UpdateArchivedStatus)) { 
-                    $status_id = ($UpdateArchivedStatus -as [int])
-                    if ($status_id -isnot [int]) {
-                        $status_id = (Get-SnipeItStatusLabelByName $UpdateArchivedStatus @passParams).id
-                        if ($status_id -isnot [int]) {
-                            Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Invalid status given to -UpdateArchivedStatus [{0}]" -f $UpdateArchivedStatus)
-                        } elseif ($sp_asset.status_label.id -ne $status_id) {
-                            $updateParams.Add("status_id", $status_id)
-                            $fieldsToUpdate += @("status_id")
+            
+            # Do we have to update the assignment?
+            if ($assigned_id -is [int] -And $sp_asset.assigned_to.id -ne $assigned_id -And $checkout_to_type -ne $null) {
+                # Get status object
+                if ($status_id -is [int]) {
+                    if ($status.id -isnot [int]) {
+                        $status = Get-SnipeItEntityByID $status_id "statuslabels" @passParams
+                        if ($status.id -isnot [int]) {
+                            Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Unknown status ID [$status_id]")
+                        }
+                    }
+                    if ($status.id -is [int] -And $status.type -ne 'deployable') {
+                        Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Status [{0}] (ID: {1}) has invalid type of [{2}] for assignment" -f $status.name, $status.id, $status.status_label.status_type)
+                    }
+                }
+                # If current status_type is not deployable, check to see if we have a deployable status we can use.
+                if ($sp_asset.status_label.status_type -ne 'deployable') {
+                    if ($status.type -ne 'deployable' -And -Not [string]::IsNullOrEmpty($DefaultAssignedStatus)) {
+                        # Check to see if we can use DefaultAssignedStatus.
+                        $status_id = ($DefaultAssignedStatus -as [int])
+                        if ($status_id -is [int]) {
+                            $status = Get-SnipeItEntityByID $status_id "statuslabels" @passParams
+                            if ($status.id -isnot [int]) {
+                                Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Invalid status ID given to -DefaultAssignedStatus [$DefaultAssignedStatus]")
+                                $status_id = $null
+                                $status = $null
+                            }
+                        } else {
+                            $status = Get-SnipeItStatusLabelByName $DefaultAssignedStatus @passParams
+                            $status_id = $status.id
+                            if ($status_id -isnot [int]) {
+                                Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Invalid status given to -DefaultAssignedStatus [$DefaultAssignedStatus]")
+                                $status_id = $null
+                                $status = $null
+                            }
                         }
                     }
                 }
+                if (-Not $updateParams.ContainsKey("assigned_to")) {
+                    $updateParams.Add("assigned_to", $assigned_id)
+                    $fieldsToUpdate += @("assigned_to")
+                }
             }
+            
+            # Do we have need to update the status ID?
+            if ($status_id -is [int]) {
+                $updateParams.Add("status_id", $status_id)
+                $fieldsToUpdate += @("status_id")
+            } elseif ($sp_asset.status_label.status_type -eq 'archived') {
+                # For archived assets, check if -UpdateArchivedStatus is set
+                if (-Not [string]::IsNullOrWhitespace($UpdateArchivedStatus)) { 
+                    $status_id = ($UpdateArchivedStatus -as [int])
+                    if ($status_id -is [int]) {
+                        $status = Get-SnipeItEntityByID $status_id "statuslabels" @passParams
+                    } else {
+                        # Search by name
+                        $status = Get-SnipeItStatusLabelByName $UpdateArchivedStatus @passParams
+                        $status_id = $status.id
+                        # Status not found by ID or name
+                        if ($status_id -isnot [int]) {
+                            Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Invalid status given to -UpdateArchivedStatus [$UpdateArchivedStatus]")
+                            $status_id = $null
+                            $status = $null
+                        }
+                    }
+                    if ($status_id -is [int] -And $sp_asset.status_label.id -ne $status_id) {
+                        $updateParams.Add("status_id", $status_id)
+                        $fieldsToUpdate += @("status_id")
+                   }
+                }
+            }
+            
             # Do we have need to update the model ID?
             # Only update when not using the default model.
-            if ($sp_model.id -is [int] -And $sp_asset.model.id -ne $sp_model.id -And -Not $using_default_model) {
+            if ($sp_model.id -is [int] -And $sp_asset.model.id -ne $sp_model.id -And -Not $usingDefaultModel) {
                 $updateParams.Add("model_id", $sp_model.id)
                 $fieldsToUpdate += @("model_id")
-            }
-            # Do we need to update the assigned_to ID?
-            if ($assigned_id -is [int] -And -Not $updateParams.ContainsKey("assigned_id")) {
-                $updateParams.Add("assigned_to", $assigned_id)
-                $fieldsToUpdate += @("assigned_to")
             }
             
             # Add custom fields to update parameters
@@ -4593,6 +4914,15 @@ function Sync-SnipeItAsset {
                 if ($sp_asset.status_label.status_type -eq 'archived' -And -Not $updateParams.ContainsKey('status_id')) {
                     Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Updating archived asset ID [{0}] without updating status" -f $sp_asset.id)
                 }
+                # Check to see if we're attempting to reassign this asset without a valid status.
+                if ($updateParams['assigned_to'] -is [int] -And (($updateParams['status_id'] -is [int] -And $status.type -ne 'deployable') -Or ($updateParams['status_id'] -isnot [int] -And $sp_asset.status_label.status_type -ne 'deployable'))) {
+                    if ($AllowAssignNonDeployableStatus) {
+                        Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Assigning asset with non-deployable status due to -AllowAssignNonDeployableStatus switch")
+                    } else {
+                        Throw [SnipeItSyncValidationException] "[Sync-SnipeItAsset] [$UniqueID] Cannot sync asset with pending assignment of [$assigned_to] - asset has non-deployable status"
+                    }
+                }
+                
                 if (-Not $DebugOutputCreateOnly) {
                     Write-Debug("[Sync-SnipeItAsset] [$UniqueID] Updating snipe-it asset ID [{0}] with parameters: {1}" -f $sp_asset.id,($updateParams | ConvertTo-Json -Depth 10))
                 }
@@ -4638,7 +4968,7 @@ function Sync-SnipeItAsset {
                     if (-Not [string]::IsNullOrWhitespace($sp_asset.StatusCode)) {
                         Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by: {1})! StatusCode: {2}, StatusDescription: {3}" -f $UniqueID,$matchfield,$sp_asset.StatusCode,$sp_asset.StatusDescription)
                     } elseif ($sp_asset.id -isnot [int]) {
-                        Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by: {1})! Returned asset has invalid ID" -f $UniqueID,$matchfield)
+                        Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by: {1})! Returned asset has invalid ID [{2}]" -f $UniqueID,$matchfield,$sp_asset.id)
                     }
                 }
             }
@@ -4890,7 +5220,7 @@ function Remove-SnipeItInactiveEntity {
                 $removeFunc = "Remove-SnipeitSupplier"
             }
             default {
-                Throw [System.Management.Automation.ValidationMetadataException] "[Remove-SnipeItInactiveEntity] Unsupported EntityType: $entityType (should never get here?)"
+                Throw [System.ArgumentException] "[Remove-SnipeItInactiveEntity] Unsupported EntityType: $entityType (should never get here?)"
             }
         }
         $sp_entities = (Get-SnipeItEntityAll $entityType @passParams).Values 
@@ -4920,9 +5250,9 @@ function Remove-SnipeItInactiveEntity {
                             # Sleep before next API call
                             Start-Sleep -Milliseconds $SleepMS
                         }
-                        # Write exception on consistent errors
+                        # Throw exception on consistent errors
                         if (-Not $update_cache) {
-                            Write-Error("[Remove-SnipeItInactiveEntity] Fatal ERROR removing inactive [{0}] from snipe-it where name=[{1}] and id={2}! StatusCode: {3}, StatusDescription: {4}" -f $entityType,$entity.name,$entity.id,$result.StatusCode,$result.StatusDescription)
+                            Throw [System.Net.WebException] ("[Remove-SnipeItInactiveEntity] Fatal ERROR removing inactive [{0}] from snipe-it where name=[{1}] and id={2}! StatusCode: {3}, StatusDescription: {4}" -f $entityType,$entity.name,$entity.id,$result.StatusCode,$result.StatusDescription)
                         } else {
                             $success = Update-SnipeItCache $entity.id $entityType -Remove
                         }
