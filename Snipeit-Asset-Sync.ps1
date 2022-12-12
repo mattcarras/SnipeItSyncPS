@@ -46,6 +46,9 @@ $ASSET_FIELD_MAP = @{
     "Primary Users"="Primary_User"
 }
 
+# Unique ID field to use in output logs. Defaults to 'Name'.
+$ASSET_FIELD_UNIQUE_ID = 'Name'
+
 # Searchbases to optionally sync information from AD.
 <#
 $AD_IMPORT_SEARCHBASES = @("OU=Domain Computers,DC=Fabrikam,DC=COM")
@@ -65,9 +68,11 @@ $ASSET_FIELD_SYNC_ON_MAP = [ordered]@{
 # This must have at least one entry.
 $ASSET_FIELD_CREATE_REQUIRED = @("Name","Serial","SMBIOS GUID","Model","Manufacturer","Category")
 # Status used when creating. This can be the status name or ID. This must be a valid status.
-$ASSET_CREATE_STATUS = "Pending"
-# Optional status used to change archived assets to when encountered in sync. This can be the status name or ID.
-# $ASSET_ARCHIVED_STATUS_CHANGE_TO = "New"
+$ASSET_STATUS_CREATE = "Pending"
+# Optional default status used to change archived assets to when encountered in sync. This can be the status name or ID.
+# $ASSET_STATUS_ARCHIVED_UPDATE = "New"
+# Optional default status used when assigning assets, must be deployable. This overrides other default statuses.
+# $ASSET_STATUS_ASSIGNED = "Ready to Deploy"
 # Default model name used when no model is found. This only accepts model names.
 # If given, this model must already be created in Snipe-It.
 $ASSET_DEFAULT_MODEL = "_Unknown PC Model_"
@@ -631,7 +636,7 @@ $formatted_assets = $joined_assets | where {$_."Exists in SCCM" -eq $true -And -
 if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container)) {
     # Rotate exports
     if ($EXPORTS_ROTATE_DAYS -is [int] -And $EXPORTS_ROTATE_DAYS -gt 0) {
-        Get-ChildItem "${EXPORTS_PATH}\*" | Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-$EXPORTS_ROTATE_DAYS) } | Remove-Item -Force
+        Get-ChildItem "${EXPORTS_PATH}\*" -File | Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-$EXPORTS_ROTATE_DAYS) } | Remove-Item -Force
     }
     if ($EXPORTS_PREFIX_FORMATTED -is [string]) {
         $fp = "${EXPORTS_PATH}\${EXPORTS_PREFIX_FORMATTED}.csv"
@@ -639,7 +644,7 @@ if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container
             Remove-Item $fp -Force
         }
         Write-Host("[{0}] Exporting formatted assets to CSV file [{1}]..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"), $fp)
-        $formatted_assets | Export-CSV -NoTypeInformation $fp
+        $formatted_assets | Export-CSV -NoTypeInformation -Force $fp
     }
 }
 
@@ -653,33 +658,34 @@ if (-Not $ENABLE_SYNC) {
     if (-Not [string]::IsNullOrWhitespace($ASSET_DEFAULT_MODEL)) {
         $extraParams.Add("DefaultModel", $ASSET_DEFAULT_MODEL)
     }
-    if (-Not [string]::IsNullOrWhitespace($ASSET_ARCHIVED_STATUS_CHANGE_TO)) {
-        $extraParams.Add('UpdateArchivedStatus', $ASSET_ARCHIVED_STATUS_CHANGE_TO)
+    if (-Not [string]::IsNullOrWhitespace($ASSET_ARCHIVED_STATUS_UPDATE)) {
+        $extraParams.Add('UpdateArchivedStatus', $ASSET_ARCHIVED_STATUS_UPDATE)
+    }
+    if (-Not [string]::IsNullOrWhitespace($ASSET_STATUS_ASSIGNED)) {
+        $extraParams.Add('DefaultAssignedStatus', $ASSET_STATUS_ASSIGNED)
+    }
+    if (-not [string]::IsNullOrEmpty($ASSET_FIELD_UNIQUE_ID)) {
+        $extraParams.Add('UniqueIDField', $ASSET_FIELD_UNIQUE_ID)
     }
     foreach ($asset in $formatted_assets) {
         try {
-            $sp_asset = Sync-SnipeItAsset -Asset $asset -UniqueIDField "Name" -SyncFields $ASSET_FIELD_MAP.Keys -SyncOnFieldMap $ASSET_FIELD_SYNC_ON_MAP -RequiredCreateFields $ASSET_FIELD_CREATE_REQUIRED -DefaultCreateStatus $ASSET_CREATE_STATUS -Verbose @extraParams
+            $sp_asset = Sync-SnipeItAsset -Asset $asset -SyncFields $ASSET_FIELD_MAP.Keys -SyncOnFieldMap $ASSET_FIELD_SYNC_ON_MAP -RequiredCreateFields $ASSET_FIELD_CREATE_REQUIRED -DefaultCreateStatus $ASSET_STATUS_CREATE -Verbose @extraParams
         } catch {
             Write-Error $_
-            $error_count += 1
+            $error_count++
         }
     }
 }
 
-Write-Host("[{0}] Caught {1} errors" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $error_count)
-
-if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container) -And $EXPORTS_PREFIX_SNIPEIT -is [string]) {
-    $fp = "${EXPORTS_PATH}\${EXPORTS_PREFIX_SNIPEIT}_$(get-date -f yyyy-MM-dd).csv"
-    if (Test-Path $fp -PathType Leaf) {
-        Remove-Item $fp -Force
-    }
-    try {
-        Write-Host("[{0}] Exporting assets from snipe-it to CSV file [{1}]..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"), $fp)
-        $formatted_assets = $sp_assets | Format-SnipeItAsset -AddDepartment
+if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container)) {
+    Write-Host("[{0}] Preparing to export assets from snipe-it..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"))
+    try {  
+        $sp_assets = (Get-SnipeItEntityAll "assets").Values | foreach { $_ } | Format-SnipeItAsset -AddDepartment
         # Ensure we have all possible custom fields in output
         # initial_props are always ordered first, the other columns are semi-sorted
+        # TODO: Gotta be a faster way of doing this.
         $initial_props = @('asset_tag','name','serial','status_label','assigned_to','Department','manufacturer','model','category')
-        $props = $formatted_assets | % { Get-Member -MemberType NoteProperty -InputObject $_ | Select -ExpandProperty Name } | Select -Unique | where {$_ -notin $initial_props}
+        $props = $sp_assets | % { Get-Member -MemberType NoteProperty -InputObject $_ | Select -ExpandProperty Name } | Select -Unique | where {$_ -notin $initial_props}
         if ($props -is [array]) {
             $props = $initial_props + $props
         } elseif ($props -is [string]) {
@@ -688,35 +694,44 @@ if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container
             # Should never get here
             $props = $initial_props
         }
-
-        $formatted_assets | Select $props | Export-CSV -NoTypeInformation $fp
+        $sp_assets = $sp_assets | Select $props
+    
+        if ($EXPORTS_PREFIX_SNIPEIT -is [string]) {
+            $fp = "${EXPORTS_PATH}\${EXPORTS_PREFIX_SNIPEIT}_$(get-date -f yyyy-MM-dd).csv"
+            Write-Host("[{0}] Exporting assets from snipe-it to CSV file [{1}]..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"), $fp)            
+            $sp_assets | Export-CSV -NoTypeInformation -Force $fp
+        }
     } catch {
         Write-Error $_
         $error_count++
     }
 }
 
+Write-Host("[{0}] Caught {1} errors" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $error_count)
+
 # Stop logging
 Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 
 # Email out notifications of any errors.
-if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP) -And ($error_count -gt 0 -And -Not [string]::IsNullOrWhiteSpace($EMAIL_ERROR_REPORT_FROM) -And ($EMAIL_ERROR_REPORT_TO -is [string] -Or ($EMAIL_ERROR_REPORT_TO -is [array] -And $EMAIL_ERROR_REPORT_TO.Count -gt 0)))) {
-    $params = @{
-        From = $EMAIL_ERROR_REPORT_FROM
-        To = $EMAIL_ERROR_REPORT_TO
-        Subject = 'Errors from Snipeit-Asset-Sync'
-        Body = "There were [$error_count] caught errors from [Snipeit-Asset-Sync.ps1] running on [${ENV:COMPUTERNAME}]. See attached logfile for more details."
-        Priority = 'High'
-        DeliveryNotificationOption = @('OnSuccess', 'OnFailure')
-        SmtpServer = $EMAIL_SMTP
+if (-Not [string]::IsNullOrEmpty($EMAIL_SMTP)) {
+    if ($error_count -gt 0 -And -Not [string]::IsNullOrEmpty($EMAIL_ERROR_REPORT_FROM) -And -Not [string]::IsNullOrEmpty($EMAIL_ERROR_REPORT_TO)) {
+        $params = @{
+            From = $EMAIL_ERROR_REPORT_FROM
+            To = $EMAIL_ERROR_REPORT_TO
+            Subject = 'Errors from Snipeit-Asset-Sync'
+            Body = "There were [$error_count] caught errors from [Snipeit-Asset-Sync.ps1] running on [${ENV:COMPUTERNAME}]. See attached logfile for more details."
+            Priority = 'High'
+            DeliveryNotificationOption = @('OnSuccess', 'OnFailure')
+            SmtpServer = $EMAIL_SMTP
+        }
+        try {
+            # Attempt to send with an attachment. If that throws an error for some reason, try sending without it.
+            Send-MailMessage -Attachments $_logfilepath @params
+        } catch {
+            Write-Error $_
+            $params['Body'] = "There were [$error_count] caught errors from [Snipeit-Asset-Sync.ps1] running on [${ENV:COMPUTERNAME}]. See [$_logfilepath] for more details."
+            Send-MailMessage @params
+        }
+        Write-Host("[{0}] Emailed error report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($EMAIL_ERROR_REPORT_TO -join ", "))
     }
-    try {
-        # Attempt to send with an attachment. If that throws an error for some reason, try sending without it.
-        Send-MailMessage -Attachments $_logfilepath @params
-    } catch {
-        Write-Error $_
-        $params['Body'] = "There were [$error_count] caught errors from [Snipeit-Asset-Sync.ps1] running on [${ENV:COMPUTERNAME}]. See [$_logfilepath] for more details."
-        Send-MailMessage @params
-    }
-    Write-Host("[{0}] Emailed error report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($EMAIL_ERROR_REPORT_TO -join ", "))
 }
