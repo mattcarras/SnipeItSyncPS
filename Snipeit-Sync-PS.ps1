@@ -270,6 +270,9 @@ function Get-SnipeItEntityAll {
         .PARAMETER ExcludeArchivedAssets
         For assets, exclude archived status type from results.
 
+        .PARAMETER ReturnValues
+        Return values instead of a hash table.
+
         .PARAMETER MaxCacheMin
         Number of Minutes from the cached entity's last update to get a fresh copy from the Snipe-It instance. If this is not given, it defaults to the last value set. If no value was ever given, it defaults to 120 minutes (2 hours). A value of 0 will always get a fresh copy each time, through the -NoCache switch can also be given to most parameters.
         
@@ -305,6 +308,9 @@ function Get-SnipeItEntityAll {
         [parameter(Mandatory=$false)]
         [switch]$ExcludeArchived,
         
+        [parameter(Mandatory=$false)]
+        [switch]$ReturnValues,
+
         [parameter(Mandatory=$false)]
         [ValidateRange(0,[int]::MaxValue)]
         [alias('MaxCacheMinutes')]
@@ -469,7 +475,11 @@ function Get-SnipeItEntityAll {
             Write-Verbose ("[Get-SnipeItEntityAll] Got back {0} results for [$EntityType]" -f $sp_entities.ht.Count)
         }
     }
-    return $sp_entities.ht
+    $sp_entities = $sp_entities.ht
+    if ($ReturnValues) {
+        $sp_entities = $sp_entities.Values | foreach {$_}
+    }
+    return $sp_entities
 }
 
 
@@ -1790,7 +1800,6 @@ function Get-SnipeItSupplierByName {
             SleepMS=$SleepMS
         }
         if (-Not $DontCreateIfNotFound) {
-            parameter(Mandatory=$false)]
             $createParams = @{}
             foreach ($param in @("address","address2","city","state","country","zip","phone","fax","email","contact","notes")) {
                 $val = $PSBoundParameters[$param]
@@ -1804,7 +1813,7 @@ function Get-SnipeItSupplierByName {
         }
     }
     Process {
-        return Get-SnipeItEntityByName $Name -EntityType "companies" @passParams
+        return Get-SnipeItEntityByName $Name -EntityType "suppliers" @passParams
     }
     End {
     }
@@ -3215,12 +3224,11 @@ function Sync-SnipeItUser {
                 $createParams["password"] = [System.Web.Security.Membership]::GeneratePassword(30, 4)
             }
             
-            # Make sure password is redacted in any logged output
-            # Note -Debug switch may still show password from SnipeitPS's output
-            $createParamsText = $createParams.Clone()
-            $createParamsText["password"] = '<PASSWORD REDACTED>'
-            $createParamsText = $createParamsText | ConvertTo-Json -Depth 3
-            Write-Debug("[Sync-SnipeItUser] Create new user parameters: $createParamsText")
+            # DEBUG
+            if (-Not [string]::IsNullOrEmpty($createParams["email"])) {
+                Write-Verbose("[Sync-SnipeItUser] Email parameter has been set for creating user [{0}]" -f $user_values["username"])
+            }
+            Write-Debug("[Sync-SnipeItUser] Create new user parameters: " + ($createParams | ConvertTo-Json -Depth 3))
             
             $count_retry = $OnErrorRetry
             while ($count_retry -ge 0) {
@@ -3319,13 +3327,14 @@ function Sync-SnipeItUser {
                     return $sp_user
                 }
                 
+                # DEBUG
+                <#
+                if (-Not [string]::IsNullOrEmpty($updateParams["email"])) {
+                    Write-Verbose("[Sync-SnipeItUser] Email parameter has been set for updating user [{0}]" -f $user_values["username"])
+                }
+                #>
                 if (-Not $DebugOutputCreateOnly) {
-                    # Make sure password is redacted in any logged output
-                    # Note -Debug switch may still show password from SnipeitPS's output
-                    $updateParamsText = $updateParams.Clone()
-                    $updateParamsText["password"] = '<PASSWORD REDACTED>'
-                    $updateParamsText = $updateParamsText | ConvertTo-Json -Depth 3
-                    Write-Debug("[Sync-SnipeItUser] Update user parameters: $updateParamsText")
+                    Write-Debug("[Sync-SnipeItUser] Update user parameters: " + ($updateParams | ConvertTo-Json -Depth 3))
                 }
                 
                 $count_retry = $OnErrorRetry
@@ -3497,7 +3506,7 @@ function Remove-SnipeItInactiveUsers {
         if ($inactive_users -isnot [array] -And $inactive_users -ne $null) {
             $inactive_users = @($inactive_users)
         }
-        Write-Verbose("[Remove-SnipeItInactiveUsers] Found {0} total snipe-it users that no longer exist in synced users, and of those {1} can be deleted" -f $inactive_users.Count, ($inactive_users | where {$_.available_actions.delete -eq $true}).Count)
+        Write-Verbose("[Remove-SnipeItInactiveUsers] Found {0} total snipe-it users that no longer exist in synced users, and of those {1} can be deleted" -f $inactive_users.Count, ($inactive_users | where {$_.available_actions.delete -eq $true} | Measure-Object).Count)
         if (-Not $OnlyReport) {
             $do_set_notes = (-Not [string]::IsNullOrEmpty($Notes))
             # Remove or flag users
@@ -3635,6 +3644,12 @@ function Sync-SnipeItDeptUsers {
         .PARAMETER SkipEmptyDepartment
         Skip creating users for empty departments. Useful if you accidentially have duplicate departments.
         
+        .PARAMETER RestrictCompany
+        Skips departments not matching given company. Assumes to be a company ID if string evaluates to a number.
+        
+        .PARAMETER SkipEmptyCompany
+        Skips departments with blank companies.
+        
         .PARAMETER NoCache
         Ignore cache and fetch everything straight from snipe-it. This effectively refreshes the cache.
         
@@ -3669,10 +3684,15 @@ function Sync-SnipeItDeptUsers {
         [parameter(Mandatory=$false)]
         [string]$Notes = "Created by API Script for Assigning Assets to Department",
         
-        # Don't create if the department has no users.
         [parameter(Mandatory=$false)]
         [switch]$SkipEmptyDepartment,
 
+        [parameter(Mandatory=$false)]
+        [string]$RestrictCompany,
+
+        [parameter(Mandatory=$false)]
+        [switch]$SkipEmptyCompany,
+        
         [parameter(Mandatory=$false)]
         [switch]$NoCache,
         
@@ -3701,14 +3721,19 @@ function Sync-SnipeItDeptUsers {
         $pp.Add("RefreshCache", $true)
     }
     # Don't wrap this call in try/catch, since we need it -- let it error.
-    $sp_depts = Get-SnipeItEntityAll "departments" @pp
-    #$sp_users = Get-SnipeItEntityAll "users" -UsersKey "username" @pp
+    $sp_depts = Get-SnipeItEntityAll "departments" -ReturnValues @pp
         
+    if(-Not [string]::IsNullOrEmpty($RestrictCompany)) {
+        $intRestrictCompany = $RestrictCompany -as [int]
+        if ($intRestrictCompany -is [int]) {
+            $RestrictCompany = $intRestrictCompany
+        }
+    }
     # For generating random passwords
     Add-Type -AssemblyName 'System.Web' 
     # Create suffixes and usernames and check to see if they already exist
     # Also check for dupes using Group-Object
-    $sp_depts.Values | foreach { $_ } | Select id,company,location,users_count,@{N="Name"; Expression={([System.Net.WebUtility]::HtmlDecode($_.Name)).Trim()}} | Select Name,id,company,location,users_count,@{N="Suffix"; Expression={($_.Name -replace '[^A-Za-z0-9]','').ToLower()}} | where {[string]::IsNullOrEmpty($_.Suffix) -ne $true} | Select Name,id,company,location,users_count,@{N="Username"; Expression={ $Prefix + '_' + $_.Suffix }} | Group-Object -Property "Username" | foreach {
+    $sp_depts | where {(-Not $SkipEmptyCompany -Or -Not [string]::IsNullOrEmpty($_.company.name)) -And ([string]::IsNullOrEmpty($RestrictCompany) -Or ($RestrictCompany -is [int] -And $_.company.id -eq $RestrictCompany) -Or ($RestrictCompany -isnot [int] -And -Not [string]::IsNullOrEmpty($_.company.name) -And [System.Net.WebUtility]::HtmlDecode($_.company.name) -eq $RestrictCompany))} | Select id,company,location,users_count,@{N="Name"; Expression={([System.Net.WebUtility]::HtmlDecode($_.Name)).Trim()}} | Select Name,id,company,location,users_count,@{N="Suffix"; Expression={($_.Name -replace '[^A-Za-z0-9]','').ToLower()}} | where {[string]::IsNullOrEmpty($_.Suffix) -ne $true} | Select Name,id,company,location,users_count,@{N="Username"; Expression={ $Prefix + '_' + $_.Suffix }} | Group-Object -Property "Username" | foreach {
         $sp_dept = $_.Group | Select -First 1
         if ($_.Count -gt 1) {
             Write-Warning ("[Sync-SnipeItDeptUsers] Departmental username [{0}] matches {2} departments, skipping" -f $_.Name, $_.Count)
@@ -4044,7 +4069,7 @@ function Sync-SnipeItAsset {
         # Anything other than the fields below are considered custom fields
         $_UPDATEFIELDS = @("asset_tag","serial","name","notes","order_number","warranty_months","purchase_cost","purchase_date","requestable","archived","url","image","image_delete")
         $_CREATEFIELDS = @("asset_tag","serial","name","notes","order_number","warranty_months","purchase_cost","purchase_date","requestable","url")
-        $_SPECIALFIELDS = @("id","customfields","assigned_to","assigned_id","checkout_to_type","status","status_id","company","location_id","Location","rtd_location_id","model","model_id","modelnumber","manufacturer","manufacturer_id","category","category_id","fieldset","fieldset_id","location_address","location_address2","location_city","location_state","location_country","location_zip","location_currency","location_parent_id","location_manager_id","location_ldap_ou","location_image","supplier","supplier_id","supplier_address","supplier_address2","supplier_city","supplier_state","supplier_country","supplier_zip","supplier_phone","supplier_fax","supplier_email","supplier_contact","supplier_notes","supplier_image")
+        $_SPECIALFIELDS = @("id","customfields","assigned_to","assigned_id","checkout_to_type","status","status_id","company","location_id","Location","rtd_location_id","model","model_id","modelnumber","manufacturer","manufacturer_id","category","category_id","fieldset","fieldset_id","location_address","location_address2","location_city","location_state","location_country","location_zip","location_currency","location_parent_id","location_manager_id","location_ldap_ou","location_image","supplier","supplier_id","supplier_address","supplier_address2","supplier_city","supplier_state","supplier_country","supplier_zip","supplier_phone","supplier_fax","supplier_email","supplier_contact","supplier_notes","supplier_image","expected_checkin")
         
         $_ALLBUILTINFIELDS = ($_UPDATEFIELDS + $_CREATEFIELDS + $_SPECIALFIELDS) | Select -Unique
 
@@ -4549,7 +4574,8 @@ function Sync-SnipeItAsset {
                 $createFields = @()
                 $unknownFields = @()
                 foreach ($field in $_syncFields) {
-                    if (-Not [string]::IsNullOrEmpty($field)) {
+                    # Exclude the "expected_checkin" field specifically. This will get set later.
+                    if (-Not [string]::IsNullOrEmpty($field) -And $field -ne "expected_checkin") {
                         $val = $Asset.$field
                         if ($val -is [hashtable] -Or -Not [string]::IsNullOrEmpty($val)) {
                             if ($Trim -And $val -is [string]) {
@@ -4675,12 +4701,44 @@ function Sync-SnipeItAsset {
                             Write-Host("[Sync-SnipeItAsset] Encountered error with create asset parameters: " + ($createParams | ConvertTo-Json -Depth 3))
                         }
                         if (-Not [string]::IsNullOrWhitespace($sp_asset.StatusCode)) {
-                            Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}]! StatusCode: {2}, StatusDescription: {3}" -f $UniqueID,$sp_asset.StatusCode,$sp_asset.StatusDescription)
+                            Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR creating snipeit asset [{0}]! StatusCode: {2}, StatusDescription: {3}" -f $UniqueID,$sp_asset.StatusCode,$sp_asset.StatusDescription)
                         } elseif ($sp_asset.id -isnot [int]) {
-                            Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}]! Returned asset has invalid ID [{1}]" -f $UniqueID, $sp_asset.id)
+                            Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR creating snipeit asset [{0}]! Returned asset has invalid ID [{1}]" -f $UniqueID, $sp_asset.id)
                         }
                     } else {
                          Write-Verbose ("[Sync-SnipeItAsset] [$UniqueID] Created new snipe-it asset (ID: {0}) with fields: {1}" -f $sp_asset.id,($createFields -join ", "))
+                         
+                         # Update newly created asset for expected_checkin if set.
+                         $expected_checkin = $Asset.expected_checkin
+                         If ((-Not [string]::IsNullOrEmpty($expected_checkin) -Or $expected_checkin -is [DateTime])) {
+                            If ($createParams['assigned_to'] -isnot [int]) {
+                                Write-Warning("[Sync-SnipeItAsset] [{0}] ERROR setting expected_checkin - no valid assignment" -f $UniqueID)
+                            } else {
+                                If ($expected_checkin -is [DateTime]) {
+                                    $expected_checkin = $expected_checkin.ToString($DateFormat)
+                                }
+                                $count_retry = $OnErrorRetry
+                                $sp_asset_created = $sp_asset
+                                while ($count_retry -ge 0) {
+                                    # Using customfields parameter 
+                                    $sp_asset = Set-SnipeitAsset -id $sp_asset_created.id -customfields @{"expected_checkin"=$expected_checkin}
+                                    if (-Not [string]::IsNullOrWhitespace($sp_asset.StatusCode) -And $sp_asset.StatusCode -in $SNIPEIT_RETRY_ON_STATUS_CODES) {
+                                        $count_retry--
+                                        Write-Warning ("[Sync-SnipeItAsset] [{0}] ERROR updating snipeit asset after creation! StatusCode: {1}, StatusDescription: {2}, Retries Left: {3}" -f $UniqueID,$sp_asset.StatusCode,$sp_asset.StatusDescription,$count_retry)
+                                    } else {
+                                        # Break out of loop early on anything except "Too Many Requests"
+                                        $count_retry = -1
+                                    }
+                                    # Sleep before next API call
+                                    Start-Sleep -Milliseconds $SleepMS
+                                }
+                                if (-Not [string]::IsNullOrWhitespace($sp_asset.StatusCode)) {
+                                    Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] after creation! StatusCode: {2}, StatusDescription: {3}" -f $UniqueID,$sp_asset.StatusCode,$sp_asset.StatusDescription)
+                                } elseif ($sp_asset.id -isnot [int]) {
+                                    Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] after creation! Returned asset has invalid ID [{1}]" -f $UniqueID, $sp_asset.id)
+                                }
+                            }
+                         }
                          $update_cache = $true
                     }
                 }
@@ -4701,6 +4759,7 @@ function Sync-SnipeItAsset {
             $fieldsToUpdate = @()
             $unknownFields = @()
             foreach ($field in $updateFields) {
+                # Exclude the expected_checkin field
                 if (-Not [string]::IsNullOrEmpty($field)) {
                     $val = $Asset.$field
                     if ($Trim -And $val -is [string]) {
@@ -4898,6 +4957,22 @@ function Sync-SnipeItAsset {
                 $fieldsToUpdate += @("model_id")
             }
             
+            # Do we have to update the expected_checkin field?
+            if (-Not $updateCustomFields.ContainsKey("expected_checkin")) {
+                $expected_checkin = $Asset.expected_checkin
+                If ($expected_checkin -is [DateTime]) {
+                    $expected_checkin = $expected_checkin.ToString($DateFormat)
+                }
+                If (-Not [string]::IsNullOrEmpty($expected_checkin)) {
+                    if ($assigned_id -isnot [int] -And $sp_asset.assigned_to.id -isnot [int]) {
+                        Write-Warning("[Sync-SnipeItAsset] [$UniqueID] Cannot set expected_checkin field - no current or updated assignment")
+                    } else {
+                        # Add to customfields parameter. This will still set the correct field in Set-SnipeitAsset.
+                        $updateCustomFields.Add("expected_checkin", $expected_checkin)
+                        $fieldsToUpdate += @("expected_checkin")
+                    }
+                }
+            }
             # Add custom fields to update parameters
             if ($updateCustomFields.Count -gt 0) {
                 $updateParams.Add("customfields", $updateCustomFields)
@@ -4908,7 +4983,7 @@ function Sync-SnipeItAsset {
             }
             # Only update if we have something to update
             if ($updateParams.Count -le 0) {
-                Write-Verbose ("[Sync-SnipeItAsset] [$UniqueID] Nothing to update for snipe-it asset ID [{0}] (matched by: {1})" -f $sp_asset.id, $matchfield)
+                Write-Verbose ("[Sync-SnipeItAsset] [$UniqueID] Nothing to update for snipe-it asset ID [{0}] (matched by {1}: {2})" -f $sp_asset.id, $matchfield, $Asset.$matchfield)
             } else {
                 # Give a warning if we're updating archived assets.
                 if ($sp_asset.status_label.status_type -eq 'archived' -And -Not $updateParams.ContainsKey('status_id')) {
@@ -4943,9 +5018,9 @@ function Sync-SnipeItAsset {
                             }
                             $updated_at = $updated_at -as [DateTime]
                             if ($updated_at -isnot [DateTime] -Or $updated_at -lt (Get-Date).AddMinutes(-15)) {
-                                Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Returned asset with ID [{0}] (matched by: {1}) has updated date is too far in the past or otherwise invalid, may not updated correctly for fields: {2}" -f $sp_asset.id,$matchfield,($fieldsUpdated -join ", "))
+                                Write-Warning ("[Sync-SnipeItAsset] [$UniqueID] Returned asset with ID [{0}] (matched by {1}: {2}) has updated date is too far in the past or otherwise invalid, may not updated correctly for fields: {3}" -f $sp_asset.id,$matchfield,$Asset.$matchfield,($fieldsToUpdate -join ", "))
                             } else {
-                                Write-Verbose ("[Sync-SnipeItAsset] [$UniqueID] Updated snipe-it asset ID [{0}] (matched by: {1}) for fields: {2}" -f $sp_asset.id,$matchfield,($fieldsToUpdate -join ", "))
+                                Write-Verbose ("[Sync-SnipeItAsset] [$UniqueID] Updated snipe-it asset ID [{0}] (matched by {1}: {2}) for fields: {3}" -f $sp_asset.id,$matchfield,$Asset.$matchfield,($fieldsToUpdate -join ", "))
                             }
                             $update_cache = $true
                             # Refetch asset from server due to https://github.com/snipe/snipe-it/issues/11725
@@ -4966,9 +5041,9 @@ function Sync-SnipeItAsset {
                         Write-Host("[Sync-SnipeItAsset] Encountered error with update asset parameters: " + ($updateParams | ConvertTo-Json -Depth 3))
                     }
                     if (-Not [string]::IsNullOrWhitespace($sp_asset.StatusCode)) {
-                        Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by: {1})! StatusCode: {2}, StatusDescription: {3}" -f $UniqueID,$matchfield,$sp_asset.StatusCode,$sp_asset.StatusDescription)
+                        Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by {1}: {2})! StatusCode: {3}, StatusDescription: {4}" -f $UniqueID,$matchfield,$Asset.$matchfield,$sp_asset.StatusCode,$sp_asset.StatusDescription)
                     } elseif ($sp_asset.id -isnot [int]) {
-                        Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by: {1})! Returned asset has invalid ID [{2}]" -f $UniqueID,$matchfield,$sp_asset.id)
+                        Throw [System.Net.WebException] ("[Sync-SnipeItAsset] Fatal ERROR updating snipeit asset [{0}] (matched by {1}: {2})! Returned asset has invalid ID [{3}]" -f $UniqueID,$matchfield,$Asset.$matchfield,$sp_asset.id)
                     }
                 }
             }
@@ -5050,8 +5125,14 @@ function Format-SnipeItAsset {
         Required. The asset object to process.
         
         .PARAMETER AddDepartment
-        Add the user's department to the output, if it exists.
+        Add the user's department to the output, if it exists. This can work recursively.
+
+        .PARAMETER AddDepartmentId
+        Add the user's department ID to the output, if it exists. This can work recursively.
         
+        .PARAMETER WarnOrphanChain
+        Give a warning when assets assigned to other assets are not assigned to anything else.
+
         .OUTPUTS
         An asset object with the result formatted for output to file.
         
@@ -5066,7 +5147,13 @@ function Format-SnipeItAsset {
         [object]$Asset,
         
         [parameter(Mandatory=$false)]
-        [switch]$AddDepartment
+        [switch]$AddDepartment,
+
+        [parameter(Mandatory=$false)]
+        [switch]$AddDepartmentId,
+
+        [parameter(Mandatory=$false)]
+        [switch]$WarnOrphanChain
     )
     Begin {
         function _formatFunc($val) {
@@ -5091,14 +5178,55 @@ function Format-SnipeItAsset {
         $existingMemberNames = $Asset | Get-Member -MemberType NoteProperty | where {$_.Name -ne "custom_fields"} | Select -ExpandProperty Name | Out-String -Stream
         $selectArray = $existingMemberNames | foreach {
             @{N=[string]$_; Expression=[Scriptblock]::Create("_formatFunc(`$_.'$_')") }
-        }
-        # Add Department column if -AddDepartment is set (will be null if not assigned to a user)
-        if ($AddDepartment) {
-            $department = $null
-            if ($Asset.assigned_to.id -is [int] -And $Asset.assigned_to.type -eq "user") {
-                $department = (Get-SnipeItEntityByID $Asset.assigned_to.id "users").department.name
+        }   
+
+        if ($Asset.assigned_to.id -is [int] -And ($AddDepartment -Or $WarnOrphanChain)) {
+            # Iterate over all parent assets to see if it's assigned to a user
+            $_asset = $Asset
+            $assetChain = $Asset.name
+            $chains = 1
+            while ($_asset.assigned_to.id -is [int] -And $_asset.assigned_to.type -eq "asset") {
+                $parent = Get-SnipeItEntityByID $_asset.assigned_to.id "assets"
+                $_asset = $parent
+                $assetChain = ("{0} => {1}" -f $assetChain, [System.Net.WebUtility]::HtmlDecode($_asset.name))
+                $chains++
             }
-            $selectArray += @{N="Department"; Expression={ [System.Net.WebUtility]::HtmlDecode($department) }}
+            # Get final owner
+            $department = $null
+            $departmentid = $null
+            $owner = $null
+            if ($_asset.assigned_to.id -is [int]) {
+                if ($_asset.assigned_to.type -eq "user") {
+                    $owner = Get-SnipeItEntityByID $_asset.assigned_to.id "users"
+                    $department = $owner.department.name
+                    if (-Not [string]::IsNullOrEmpty($department)) {
+                        $department = [System.Net.WebUtility]::HtmlDecode($department)
+                    }
+                    $departmentid = $owner.department.id
+                } elseif ($_asset.assigned_to.type -eq "location") {
+                    $owner = Get-SnipeItEntityByID $_asset.assigned_to.id "locations"
+                }
+                $assetChain = ("{0} => {1}" -f $assetChain, [System.Net.WebUtility]::HtmlDecode($owner.name))
+            }
+            # Add Department column if -AddDepartment is set
+            if ($AddDepartment) {
+                $selectArray += @{N="Department"; Expression={ $department }}
+            }
+            # Add Department ID column if -AddDepartmentId is set
+            if ($AddDepartmentId) {
+                $selectArray += @{N="Department ID"; Expression={ $departmentid }}
+            }
+            if ($chains -gt 1) {
+                if ($_asset.assigned_to.id -isnot [int] -And $WarnOrphanChain) {
+                    Write-Warning("[Format-SnipeItAsset] Asset assignment chain of [$assetChain] has no owner")
+                } else {
+                    Write-Verbose("[Format-SnipeItAsset] Asset assignment chain: $assetChain") 
+                    if ($_asset.assigned_to.id -is [int] -And [string]::IsNullOrEmpty($department)) {
+                        Write-Debug("[Format-SnipeItAsset] Asset chain missing department -- Owner: {0}, Type: {1}, Department ID {2}" -f [System.Net.WebUtility]::HtmlDecode($owner.name), $_asset.assigned_to.type, $owner.department.id)
+                    }
+                }        
+                                
+            }
         }
         # Add custom field names back into the main object
         if ($Asset.custom_fields -is [PSObject]) {
@@ -5262,3 +5390,206 @@ function Remove-SnipeItInactiveEntity {
         }
     }
 }
+
+function Update-SnipeItInactiveUserReassignment {
+    <#
+        .SYNOPSIS
+        Reassigns assets assigned to undeletable inactive users to departmental users, if applicable.
+        
+        .DESCRIPTION
+        Reassigns assets assigned to undeletable inactive users to departmental users, if applicable. This function requires the RSAT tools for calling Get-ADUser.
+        
+        .PARAMETER InactiveUsers
+        Required. An array containing all inactive users.
+
+        .PARAMETER ADPropertyUsername
+        The AD property to search by username for whether the user still exists in AD. Defaults to UserPrincipalName.
+
+        .PARAMETER ADPropertyEmployeeNum
+        The AD property optionally synced to employee_num user field in snipe-it. Can accept "SID" for the AD user's SID value.
+
+        .PARAMETER Status
+        The status to change to on reassignment. This can be an id or name.
+
+        .PARAMETER ExpectedCheckinDate
+        Set the expected checkin date to the given date on reassignment.
+
+        .PARAMETER OnlyReassignDeleted
+        If enabled, only reassign deleted or disabled users (_ExistsInAD column).
+
+        .PARAMETER DepartmentalUsernameFilter
+        Prefix or search string to use to differentiate departmental users. Defaults to "_dept_*".
+
+        .PARAMETER DepartmentalUserCompany
+        Restrict departmental users to only those assigned to the given company name or id.
+
+        .PARAMETER OnErrorRetry
+        The number of times to retry if we get certain error codes like "Too Many Requests" (default: 3). Give 0 to never retry.
+
+        .PARAMETER SleepMS
+        The number of milliseconds to sleep after each API call (default: 1000ms).
+        
+        .OUTPUTS
+        None.
+        
+        .Example
+        PS> Update-SnipeItInactiveUserAssetReassignment -InactiveUsers $inactive_users -Status 10 -OnlyReassignForDeleted
+    #>
+    param (
+        [parameter(Mandatory=$true,
+                   Position=0)]
+        [object[]]$InactiveUsers,
+        
+        [parameter(Mandatory=$false)]
+        [string]$ADPropertyUsername="UserPrincipalName",
+
+        [parameter(Mandatory=$false)]
+        [string]$ADPropertyEmployeeNum,
+
+        [parameter(Mandatory=$false)]
+        [string]$Status,
+
+        [parameter(Mandatory=$false)]
+        [datetime]$ExpectedCheckinDate,
+
+        [parameter(Mandatory=$false)]
+        [switch]$OnlyReassignDeleted,
+
+        [parameter(Mandatory=$false)]
+        [string]$DepartmentalUsernameFilter="_dept_*",
+
+        [parameter(Mandatory=$false)]
+        [string]$DepartmentalUserCompany,
+
+        [parameter(Mandatory=$false)]
+        [ValidateRange(0,[int]::MaxValue)]
+        [int]$OnErrorRetry=3,
+        
+        [parameter(Mandatory=$false)]
+        [ValidateRange(0,[int]::MaxValue)]
+        [int]$SleepMS=1000
+    )
+
+    $passParams = {
+        OnErrorRetry = $OnErrorRetry
+        SleepMS = $SleepMS
+    }
+
+    $error_count = 0
+
+    $company_id = $null
+    if(-Not [string]::IsNullOrEmpty($DepartmentalUserCompany)) {
+        $company_id = $DepartmentalUserCompany -as [int]
+    }
+
+    # Add department along with username, if it exists
+    $inactive_users_undeletable = $InactiveUsers | where {$_.available_actions.delete -eq $false} | Select *,
+        @{N="_UsernameWithDept"; Expression={ 
+            if (-Not [string]::IsNullOrEmpty($_.department.name)) { 
+                ("{0} ({1})" -f $_.username, [System.Net.WebUtility]::HtmlDecode($_.department.name)) 
+            } else { 
+                $_.username 
+            }
+        }},
+        @{N="_ExistsInAD"; Expression={
+            # Check to see if user still exists in AD.
+            try {
+                $id = $null
+                $adUser = $null
+                $user = $_
+                if ($ADPropertyEmployeeNum -eq "SID" -And -Not [string]::IsNullOrEmpty($user.employee_num)) {
+                    $id = $user.employee_num
+                    $prop = $ADPropertyEmployeeNum
+                } else {
+                    $prop = $ADPropertyUsername
+                    if (-Not $user.username.Contains('@')) {
+                        $id = $user.username
+                    }
+                }
+                if (-Not [string]::IsNullOrEmpty($id)) {
+                    # Search identity
+                    $adUser = Get-ADUser $id -ErrorAction SilentlyContinue
+                } else {
+                    $un = $user.username
+                    if (-Not [string]::IsNullOrEmpty($prop)) {
+                        # Search given property
+                        $adUser = Get-ADUser -LDAPFilter "($prop=$un)" -ErrorAction SilentlyContinue | Select -First 1
+                    } else {
+                        $adUser = Get-ADUser -LDAPFilter "(|(UserPrincipalName=$un)(mail=$un))" -ErrorAction SilentlyContinue | Select -First 1
+                    }
+                }
+                $adUser.Enabled -eq $true
+            } catch {
+                $false
+            }
+        }}
+
+    $dept_users = Get-SnipeItEntityAll "users" -ReturnValues | where {$_.username -like $DepartmentalUsernameFilter -And $_.department.id -is [int] -And ([string]::IsNullOrEmpty($DepartmentalUserCompany) -Or ($_.company.id -is [int] -And (($company_id -ne $null -And $_.company.id -eq $company_id) -Or ($company_id -eq $null -And -Not [string]::IsNullOrEmpty($_.company.name) -And [System.Net.WebUtility]::HtmlDecode($_.company.name) -eq $DepartmentalUserCompany))))}
+    Write-Verbose("[Update-SnipeItInactiveUserReassignment] Found [{0}] department users" -f $dept_users.Count)
+    # Get all users with assignments that no longer exist in AD if switch is given.
+    $inactive_users_reassignable = $inactive_users_undeletable | where {(-Not $_._ExistsInAD -Or -Not $OnlyReassignDeleted) -And $_.department.id -is [int] -And $_.assets_count -gt 0}
+    If($OnlyReassignDeleted) {
+        Write-Verbose("[Update-SnipeItInactiveUserReassignment] Processing [{0}] reassignable users (excluding [{1}] which still exist in AD)" -f $inactive_users_reassignable.Count, ($inactive_users_undeletable | where {$_._ExistsInAD -And $_.department.id -is [int] -And $_.assets_count -gt 0}).Count)
+    } else {
+        Write-Verbose("[Update-SnipeItInactiveUserReassignment] Processing [{0}] reassignable users (including [{1}] which still exist in AD)" -f $inactive_users_reassignable.Count, ($inactive_users_undeletable | where {$_._ExistsInAD -And $_.department.id -is [int] -And $_.assets_count -gt 0}).Count)
+    }
+    if($inactive_users_reassignable.Count -gt 0 -And $dept_users.Count -gt 0) {
+        $sp_assets = Get-SnipeitEntityAll "assets" -ReturnValues
+        $extraParams = @{}
+        If(-Not [string]::IsNullOrEmpty($Status)) {
+            $status_id = $Status -as [int]
+            if($status_id -isnot [int]) {
+                $extraParams.Add('status_id', $status_id)
+            } else {
+                $status_id = (Get-SnipeItEntityByName -EntityType "statuslabels" @passParams).id
+            }
+            if ($status_id -isnot [int]) {
+                Throw [SnipeItSyncObjectNotFoundException] "[Update-SnipeItInactiveUserReassignment] Status name not found in snipe-it: [$Status]"
+            } else {
+                $extraParams.Add('status_id', $status_id)
+            }
+        }
+
+        # If ExpectedCheckinDate is set, add it as a custom field to the Set-SnipeitAsset request (since the function doesn't support this field by default)
+        If($ExpectedCheckinDate -is [datetime]) {
+            $extraParams.Add('customfields', @{"expected_checkin"=$ExpectedCheckinDate.toString('yyyy-MM-dd')})
+        }
+
+        # Loop over all users who no longer exist in AD and have a valid company set.
+        $inactive_users_reassignable = $inactive_users_reassignable | Select *,@{N="_Reassigned"; Expression={ 
+                $user = $_
+                # Find a department user to assign the asset to.                           
+                $dept_user = $dept_users | where {$_.department.id -eq $user.department.id} | Select -First 1
+                $assignment_result = $false
+                if ($dept_user.id -is [int]) {
+                    Write-Verbose("[Update-SnipeItInactiveUserReassignment] Found department user [{0}] for inactive user [{1}] with department [{2}] and {3} assigned assets" -f $dept_user.username, $user.username, $user.department.name, $user.assets_count)
+                    foreach($asset in ($sp_assets | where {$_.assigned_to.id -eq $user.id})) {
+                        try {
+                            Write-Verbose("[Update-SnipeItInactiveUserReassignment] Reassigning asset (Tag: [{0}], Serial: [{1}], Name: [{2}]) to [{3}]" -f $asset.asset_tag, $asset.serial, $asset.name, $dept_user.username)
+                            $result = Set-SnipeitAsset -id $asset.id -assigned_to $dept_user.id @extraParams
+                            $assignment_result = ($result.id -is [int])         
+                        } catch {
+                            # Note: Set-SnipeitAsset doesn't return all errors
+                            Write-Error $_
+                            $error_count += 1
+                            $assignment_result = $false
+                        }
+                    }
+                } else {
+                    Write-Warning("[Update-SnipeItInactiveUserReassignment] No valid department user found for inactive user [{0}] with department [{1}] and {2} assigned assets" -f $user.username, $user.department.name, $user.assets_count)
+                }
+
+                # Return reassignment success/failure
+                $assignment_result
+            }
+        }
+        $inactive_users_reassigned = $inactive_users_reassignable | where {$_._Reassigned -eq $true}
+    }
+    return @{
+        reassignable=$inactive_users_reassignable
+        reassigned=$inactive_users_reassigned
+        undeletable=$inactive_users_undeletable
+        errorCount=$error_count
+    }
+}
+
