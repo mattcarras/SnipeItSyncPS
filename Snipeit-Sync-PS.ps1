@@ -5539,8 +5539,6 @@ function Update-SnipeItInactiveUserReassignment {
         If(-Not [string]::IsNullOrEmpty($Status)) {
             $status_id = $Status -as [int]
             if($status_id -isnot [int]) {
-                $extraParams.Add('status_id', $status_id)
-            } else {
                 $status_id = (Get-SnipeItEntityByName -EntityType "statuslabels" @passParams).id
             }
             if ($status_id -isnot [int]) {
