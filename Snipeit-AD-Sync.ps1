@@ -50,6 +50,7 @@ $AD_GROUP_PROPERTY_MAP = @{
     "email"="mail"
     #"manager"="manager"
     #"location"="physicaldeliveryofficename"
+    #"location_address"="foo"   # AD Attribute to sync in the Address field if new location.
 }
 # Filter the results based on the given map of Properties.
 # These properties do not need to be defined in the property map.
@@ -80,8 +81,17 @@ $AD_SYNC_DELETED_USERS_SKIP = $false
 # Path to save latest deleted users report
 # $AD_SYNC_DELETED_USERS_EXPORT_PATH = "path\to\deleted_users_report.csv"
 
+# Reassign any equipment assigned to a deleted user to a special department user if true.
+$AD_SYNC_DELETED_USERS_REASSIGN_TO_DEPARTMENT = $false
+# Only reassign equipment if the user was deleted from AD entirely.
+#$AD_SYNC_DELETED_USERS_REASSIGN_TO_DEPARTMENT_ONLY_DELETED = $true
+# Change to the given status ID when reassigning assets if set. This status must already exist.
+#$AD_SYNC_DELETED_USERS_REASSIGN_TO_DEPARTMENT_STATUS_ID = 1
+
 # Create special users for each department to allow assigning assets to departments.
-$AD_SYNC_DEPARTMENT_USERS = $true
+#$AD_SYNC_DEPARTMENT_USERS = $true
+# Only create special department users when the following company is set.
+#$AD_SYNC_DEPARTMENT_USERS_RESTRICT_COMPANY = "My Company"
 
 # To make doubly sure we aren't duplicating any entities, halt if the list of users, depts, and/or locations are empty.
 # This is useful if you know all the entities (users, departments, companies, and locations) should return at least 1 result.
@@ -111,7 +121,11 @@ $EMAIL_DELETED_USERS_REPORT = $false
 $EMAIL_DELETED_USERS_REPORT_FROM = '<from address>'
 # May include multiple destination addresses as an array.
 $EMAIL_DELETED_USERS_REPORT_TO = '<to address>'
+# Overrides $EMAIL_DELETED_USERS_REPORT_TO
+#$EMAIL_DELETED_USERS_REPORT_TO_GROUPMEMBERS = 'snipeit-reports-group'
 $EMAIL_DELETED_USERS_REPORT_SUBJECT = 'Weekly Inactive Snipe-It Users Report'
+# Field to check for reporting EOL assets owned by reassigned users (optional).
+#$EMAIL_DELETED_USERS_REPORT_ASSET_EOL_CUSTOMFIELD = "End of Life"
 #>
 # -- END CONFIGURATION --
 
@@ -128,9 +142,15 @@ if ($LOGFILE_ROTATE_DAYS -is [int] -And $LOGFILE_ROTATE_DAYS -gt 0) {
 }
 
 # Start logging
-$_logfilepath = "${LOGFILE_PATH}\${LOGFILE_PREFIX}_$(get-date -f yyyy-MM-dd).log"
+$_logfilepath = "${LOGFILE_PATH}\${_logfileprefix}_$(get-date -f yyyy-MM-dd).log"
 Start-Transcript -Path $_logfilepath -Append
 
+if (($EMAIL_DELETED_USERS_REPORT -Or $EmailDeletedUsersReport) -And [string]::IsNullOrWhitespace($EMAIL_DELETED_USERS_REPORT_TO_GROUPMEMBERS)) {
+    $emailDeletedUsersReportTo = Get-ADGroupMember $EMAIL_DELETED_USERS_REPORT_TO_GROUPMEMBERS -Recursive | foreach { Get-ADUser $_ -Properties mail | Select -ExpandProperty mail }
+} else {
+    $emailDeletedUsersReportTo = $EMAIL_DELETED_USERS_REPORT_TO
+}
+    
 # -- START FUNCTIONS --
 function Get-ADUsersByGroup {
     <#
@@ -194,29 +214,31 @@ function Get-ADUsersByGroup {
             $ad_users += Get-ADGroup $group -Properties Member -ErrorAction Stop | Select -ExpandProperty Member
         }
     }
-    # Get extra attributes for each user
-    $props = $ADProperties
-    if ($props -ne $null -And -Not $props -is [array]) {
-        $props = @($props)
-    }
-    $props += ($ADPropertyFilterMap.Keys + @("distinguishedname")) | Sort -Unique
-    Write-Debug "[Get-ADUsersByGroup] Properties: $props"
-    Write-Verbose ("[Get-ADUsersByGroup] Getting properties for {0} users..." -f $ad_users.Count)
-    $ad_users = $ad_users | foreach { Get-ADUser $_ -Properties $props }
-    
-    # Create dynamic filter from given parameters
-    $filterscript = ($ADPropertyFilterMap.GetEnumerator() | Foreach-Object { if ($_.Value -is [hashtable]) { $op=$_.Value.operator; $val=$_.Value.Value } else { $op="ne"; $val=$_.Value }; "`$_.{0} -{1} `"{2}`"" -f $_.Key, $op, $val}) -join " -AND "
-    if (-Not $IncludeDisabled) {
-        $filter = "`$_.Enabled -eq `$true"
-        if ([string]::IsNullOrWhitespace($filterscript)) {
-            $filterscript = $filter
-        } else {
-            $filterscript += " -AND $filter"
+    if ($ad_users -ne $null) {
+        # Get extra attributes for each user
+        $props = $ADProperties
+        if ($props -ne $null -And -Not $props -is [array]) {
+            $props = @($props)
         }
-    }
-    Write-Debug "[Get-ADUsersByGroup] AD Group Filter: $filterscript"
-    if (-Not [string]::IsNullOrWhitespace($filterscript)) {
-        $ad_users = $ad_users | Where-Object -FilterScript ([scriptblock]::create($filterscript))
+        $props += ($ADPropertyFilterMap.Keys + @("distinguishedname")) | Sort -Unique
+        Write-Debug "[Get-ADUsersByGroup] Properties: $props"
+        Write-Verbose ("[Get-ADUsersByGroup] Getting properties for {0} users..." -f $ad_users.Count)
+        $ad_users = $ad_users | foreach { Get-ADUser $_ -Properties $props }
+    
+        # Create dynamic filter from given parameters
+        $filterscript = ($ADPropertyFilterMap.GetEnumerator() | Foreach-Object { if ($_.Value -is [hashtable]) { $op=$_.Value.operator; $val=$_.Value.Value } else { $op="ne"; $val=$_.Value }; "`$_.{0} -{1} `"{2}`"" -f $_.Key, $op, $val}) -join " -AND "
+        if (-Not $IncludeDisabled) {
+            $filter = "`$_.Enabled -eq `$true"
+            if ([string]::IsNullOrWhitespace($filterscript)) {
+                $filterscript = $filter
+            } else {
+                $filterscript += " -AND $filter"
+            }
+        }
+        Write-Debug "[Get-ADUsersByGroup] AD Group Filter: $filterscript"
+        if (-Not [string]::IsNullOrWhitespace($filterscript)) {
+            $ad_users = $ad_users | Where-Object -FilterScript ([scriptblock]::create($filterscript))
+        }
     }
     Write-Verbose ("[Get-ADUsersByGroup] Total filtered AD users collected: {0}" -f $ad_users.Count)
     
@@ -300,10 +322,10 @@ function Format-UserForSyncing {
     End {
     }
 }
-
+    
 # -- END FUNCTIONS --
 
-# Dot-source custom sync API
+# Load custom API
 try {
     . .\SnipeIt-Sync-PS.ps1
 } catch {
@@ -313,8 +335,14 @@ try {
     return -1
 }
 
+$spHostURL = $null
 try {
     Connect-SnipeIt -CredXML $CREDXML_PATH -Verbose
+    # Used for reports.
+    $spHostURL = (Import-CliXml $CREDXML_PATH).Username
+    if (-Not $spHostURL.EndsWith('/')) {
+        $spHostURL += '/'
+    }
 } catch {
     # Fatal error, exit
     Write-Error $_
@@ -333,8 +361,8 @@ If ($AD_GROUP_PROPERTY_MAP.ContainsKey("location")) {
 If ($AD_GROUP_PROPERTY_MAP.ContainsKey("department")) {
     $cacheentities += @("departments")
 }
-
 $extraParams = @{}
+
 If ($DEBUG_HALT_ON_NULL_CACHE) {
     $extraParams.Add("ErrorOnNullEntities", $cacheentities)
 }
@@ -356,7 +384,7 @@ $ad_users = $AD_GROUP_TARGETS | foreach {
             $activated = $_.activated 
         }
         $groups = $null 
-        if (($_.groups | Select -First 1) -is [int]) {
+        if ($_.groups -is [int] -Or $_.groups -is [array]) {
             $groups = $_.groups 
         }
         
@@ -392,12 +420,8 @@ if (-Not [string]::IsNullOrWhitespace($AD_GROUP_PROPERTY_MAP["manager"])) {
     $formatted_users = $formatted_users | Select *,@{N="manager"; Expression={$manager = $_.manager; if (-Not [string]::IsNullOrWhitespace($manager) ) { if ($_.distinguishedname -eq $manager) { Write-Warning("User with username [{0}], employee_num [{1}] has self as manager, skipping adding manager reference" -f $_.username, $_.employee_num); $null } elseif (($user = $formatted_users | where {$_.distinguishedname -eq $manager} | Select -First 1) -And -Not [string]::IsNullOrWhitespace($user.username)) { $user } else { $null }}}} -ExcludeProperty "manager"
 }
 
-# Sync users with Snipe-It.
-$extraParams = @{}
-if ($AD_SYNC_ON_EMPLOYEE_NUM) {
-    $extraParams.Add("SyncOnEmployeeNum", $true)
-}
 
+# Sync users with Snipe-It.
 $error_count = 0
 if (-Not $ENABLE_SYNC -Or $DisableSync) {
     if (-Not $ENABLE_SYNC) {
@@ -407,6 +431,10 @@ if (-Not $ENABLE_SYNC -Or $DisableSync) {
         Write-Host('Not syncing due to given -DisableSync switch.')
     }
 } else {
+    $extraParams = @{}
+    if ($AD_SYNC_ON_EMPLOYEE_NUM) {
+        $extraParams.Add("SyncOnEmployeeNum", $true)
+    }
     Write-Host("[{0}] Starting sync..." -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")))
     foreach($user in $formatted_users) {
         try {
@@ -416,66 +444,105 @@ if (-Not $ENABLE_SYNC -Or $DisableSync) {
             $error_count += 1
         }
     }
-    
-    # Create users for assigning assets to departments
-    if ($AD_SYNC_DEPARTMENT_USERS) {
-        Sync-SnipeItDeptUsers -SyncCompany -SkipEmptyDepartment -Verbose
+}
+
+# Create users for assigning assets to departments
+if ($AD_SYNC_DEPARTMENT_USERS) {
+    $extraParams = @{}
+    if (-Not [string]::IsNullOrEmpty($AD_SYNC_DEPARTMENT_USERS_RESTRICT_COMPANY)) {
+        $extraParams.Add("RestrictCompany", $AD_SYNC_DEPARTMENT_USERS_RESTRICT_COMPANY)
+        $extraParams.Add("SkipEmptyCompany", $true)
     }
+    Sync-SnipeItDeptUsers -SyncCompany -SkipEmptyDepartment -Verbose @extraParams
 }
 
 # Flag users that no longer exist in targeted AD groups and delete them if they have 0 assignments of all types
-# For safety either $AD_SYNC_ON_EMPLOYEE_NUM must be enabled or all target groups must have ldap_import enabled.
-# This ensures the special department and API users don't get flagged or purged.
-# Flag users that no longer exist in targeted AD groups and delete them if they have 0 assignments of all types
-$inactive_users_undeletable = $null
 $inactive_users = $null
+$inactive_users_undeletable = $null
+$inactive_users_reassigned = $null
 $inactive_users_deletable_count = 0
 if ($formatted_users.Count -gt 0 -And -Not $AD_SYNC_DELETED_USERS_SKIP) {
     $_all_ldap_import = ($AD_GROUP_TARGETS | where {$_.ldap_import -eq $true}).Count -eq $AD_GROUP_TARGETS.Count
     if (-Not $AD_SYNC_ON_EMPLOYEE_NUM -And -Not $_all_ldap_import) {
-        Write-Host('[{0}] Skipping deleted users -- please either set AD_SYNC_ON_EMPLOYEE_NUM or make sure all target AD groups set to use ldap_import if needed' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")))
+        Write-Host('[{0}] Skipping deleted users -- please either set AD_SYNC_ON_EMPLOYEE_NUM or make sure all target AD groups set to use ldap_import' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")))
     } else {
-        $extraParams = @{}
+        $duParams = @{}
         if ($AD_SYNC_ON_EMPLOYEE_NUM) {
-            $extraParams.Add("CompareEmployeeNum", $true)
+            $duParams.Add("CompareEmployeeNum", $true)
         }
         if ($_all_ldap_import) {
-            $extraParams.Add("OnlyIfLdapImport", $true)
+            $duParams.Add("OnlyIfLdapImport", $true)
             if ($AD_SYNC_ON_EMPLOYEE_NUM) {
-                $extraParams.Add("AlsoCompareUsername", $true)
+                $duParams.Add("AlsoCompareUsername", $true)
             }
         }
         if (-Not $ADSyncDeletedUsersPurge) {
             if ($AD_SYNC_DELETED_USERS_REPORT_ONLY) {
                 Write-Host('[{0}] Will only report on inactive/deletable snipe-it users' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")))
-                $extraParams.Add("OnlyReport", $true)
+                $duParams.Add("OnlyReport", $true)
             } elseif (-Not $AD_SYNC_DELETED_USERS_PURGE) {
                 Write-Host('[{0}] NOT purging inactive/deletable snipe-it users' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")))
-                $extraParams.Add("DontDelete", $true)
+                $duParams.Add("DontDelete", $true)
             }
         }
-        if (-Not $extraParams.DontDelete -And -Not $extraParams.OnlyReport) {
+        if (-Not $duParams.DontDelete -And -Not $duParams.OnlyReport) {
             Write-Host('[{0}] PURGING inactive/deletable snipe-it users' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")))
         }
-        $inactive_users = Remove-SnipeItInactiveUsers -CompareUsers $formatted_users -Verbose @extraParams 
+        $inactive_users = Remove-SnipeItInactiveUsers -CompareUsers $formatted_users -Verbose @duParams 
         
-        if ($inactive_users.Count -gt 0) {
-            # Add department along with username, if it exists
-            $inactive_users_undeletable = $inactive_users | where {$_.available_actions.delete -eq $false} | Select *,@{N="_UsernameWithDept"; Expression={ if (-Not [string]::IsNullOrEmpty($_.department.name)) { ("{0} ({1})" -f $_.username, [System.Net.WebUtility]::HtmlDecode($_.department.name)) } else { $_.username }}}
+        if ($inactive_users -ne $null) {
+            Write-Host('[{0}] Processing inactive users' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")))
+            If($AD_SYNC_DELETED_USERS_REASSIGN_TO_DEPARTMENT) {
+                $ruParams = @{}
+                If(-Not [string]::IsNullOrEmpty($AD_GROUP_PROPERTY_MAP["username"])) {
+                    $ruParams.Add("ADPropertyUsername", $AD_GROUP_PROPERTY_MAP["username"])
+                }
+                If(-Not [string]::IsNullOrEmpty($AD_GROUP_PROPERTY_MAP["employee_num"])) {
+                    $ruParams.Add("ADPropertyEmployeeNum", $AD_GROUP_PROPERTY_MAP["employee_num"])
+                }
+                If($AD_SYNC_DELETED_USERS_REASSIGN_TO_DEPARTMENT_ONLY_DELETED) {
+                    $ruParams.Add("OnlyReassignDeleted", $true)
+                }
+                If(-Not [string]::IsNullOrEmpty($AD_SYNC_DEPARTMENT_USERS_RESTRICT_COMPANY)) {
+                    $ruParams.Add("DepartmentalUserCompany", $AD_SYNC_DEPARTMENT_USERS_RESTRICT_COMPANY)
+                }
+
+                $results = $null
+                try {           
+                    $results = Update-SnipeItInactiveUserReassignment -InactiveUsers $inactive_users -Status $AD_SYNC_DELETED_USERS_REASSIGN_TO_DEPARTMENT_STATUS_ID -ExpectedCheckinDate (Get-Date) -Verbose @ruParams
+                } catch {
+                    Write-Error $_
+                    $error_count += 1
+                }
+                if($results -ne $null) {
+                    If($results.error_count -gt 0) {
+                        $error_count += $results.error_count
+                    }
+                    $inactive_users_undeletable = $results.undeletable
+                    $inactive_users_reassigned = $results.reassigned
+                    If($inactive_users_reassigned.Count -gt 0) {
+                        # Attempt to remove the reassigned users, making sure to refresh the cache.
+                        $inactive_users_undeletable_2ndpass = Remove-SnipeItInactiveUsers -CompareUsers $formatted_users -Verbose -RefreshCache @duParams | where {$_.available_actions.delete -eq $false}
+                        # Filter out already reassigned users.
+                        $inactive_users_undeletable = $inactive_users_undeletable | where {$inactive_users_undeletable_2ndpass.id -contains $_.id}
+                    }
+                }
+            }
+            
             $inactive_users_undeletable_count = $inactive_users_undeletable.Count
             $inactive_users_deletable = $inactive_users | where {$_.available_actions.delete -eq $true} | Select -ExpandProperty username
             $inactive_users_deletable_count = $inactive_users_deletable.Count
             $inactive_users_deletable = $inactive_users_deletable -join ", "
             if (-Not [string]::IsNullOrEmpty($inactive_users_undeletable)) {
-                Write-Host('[{0}] Inactive snipe-it users that no longer exist in AD and CANNOT be deleted: {1}' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($inactive_users_undeletable._UsernameWithDept -join ", "))
+                Write-Host('[{0}] Inactive snipe-it users that no longer exist in target groups and CANNOT be deleted (still have active assignments and cannot be reassigned): {1}' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($inactive_users_undeletable._UsernameWithDept -join ", "))
             }
             if (-Not [string]::IsNullOrEmpty($inactive_users_deletable)) {
-                Write-Host('[{0}] Inactive snipe-it users that no longer exist in AD and can/have been deleted: {1}' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $inactive_users_deletable)
+                Write-Host('[{0}] Inactive snipe-it users that no longer exist in target groups and can/have been deleted: {1}' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $inactive_users_deletable)
             }
-            if (-Not [string]::IsNullOrWhiteSpace($AD_SYNC_EXPORT_DELETED_USERS_PATH)) {
-                $inactive_users | Select *,@{N="_DELETABLE_"; Expression={ $_.available_actions.delete -eq $true }} | Format-SnipeItEntity | Select username,first_name,last_name,employee_num,jobtitle,department,name,location,manager,notes,* -ExcludeProperty username,first_name,last_name,employee_num,jobtitle,department,name,location,manager,notes | Export-CSV -NoTypeInformation -Force $AD_SYNC_EXPORT_DELETED_USERS_PATH
-                if (Test-Path $AD_SYNC_EXPORT_DELETED_USERS_PATH -PathType Leaf) {
-                    Write-Host('[{0}] Inactive user report has been saved to [{1}].' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $AD_SYNC_EXPORT_DELETED_USERS_PATH)
+            if (-Not [string]::IsNullOrWhiteSpace($AD_SYNC_DELETED_USERS_EXPORT_PATH)) {
+                $inactive_users | Select *,@{N="_DELETABLE_"; Expression={ $_.available_actions.delete -eq $true }} | Format-SnipeItEntity | Select username,first_name,last_name,employee_num,jobtitle,department,name,location,manager,notes,* -ExcludeProperty username,first_name,last_name,employee_num,jobtitle,department,name,location,manager,notes | Export-CSV -NoTypeInformation -Force $AD_SYNC_DELETED_USERS_EXPORT_PATH
+                if (Test-Path $AD_SYNC_DELETED_USERS_EXPORT_PATH -PathType Leaf) {
+                    Write-Host('[{0}] Inactive user report has been saved to [{1}].' -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), $AD_SYNC_DELETED_USERS_EXPORT_PATH)
                 }
             }
         }
@@ -489,6 +556,10 @@ if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP)) {
     # Email out a report on deleted users.
     if ($EMAIL_DELETED_USERS_REPORT -Or $EmailDeletedUsersReport) {
         if (-Not [string]::IsNullOrEmpty($inactive_users_undeletable) -And $inactive_users -ne $null -And -Not [string]::IsNullOrWhiteSpace($EMAIL_DELETED_USERS_REPORT_FROM) -And -Not [string]::IsNullOrEmpty($emailDeletedUsersReportTo) -And -Not [string]::IsNullOrEmpty($EMAIL_DELETED_USERS_REPORT_SUBJECT)) {
+            # Get all assets to check EOL dates
+            $sp_assets = Get-SnipeItEntityAll "assets" -ReturnValues
+            # Construct email
+            $groups = $AD_GROUP_TARGETS.groupname -join ", "
             $total_count = $inactive_users.Count
             $datestamp = (Get-Date).toString("yyyy/MM/dd HH:mm:ss")
             if (($AD_SYNC_DELETED_USERS_PURGE -Or $ADSyncDeletedUsersPurge) -And -Not $AD_SYNC_DELETED_USERS_REPORT_ONLY) {
@@ -500,38 +571,24 @@ if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP)) {
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"  "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head>
 <meta http-equiv="Content-Type" content="text/html; charset=us-ascii"><title>HTML TABLE</title>
 </head><body>
-<p>There are [$total_count] users in Snipe-It that no longer exist in target AD group(s), of which [$inactive_users_deletable_count] ${deletable_action}. A user must have all their assignments checked in before they can be deleted.</p>
-
-<p>Inactive snipe-it users which cannot be deleted:</p>
-<table border="1">
-<tr><td>Username</td><td>Department (Last Known)</td><td>Exists in AD</td><td>Assignments</td></tr>
+<p>There are [$total_count] users in snipe-it that no longer exist in target AD group(s): ${groups}</p>
+<p>[$inactive_users_deletable_count] of these users ${deletable_action}.</p>
 "@
+            if ($AD_SYNC_DELETED_USERS_REASSIGN_TO_DEPARTMENT) {
+            $body += ("<p>[{0}] of these users had their assets reassigned to their department.</p>" -f $inactive_users_reassigned.Count)
+            }
+            $body += @"
+<p>A user must have all their assignments checked in before they can be deleted from snipe-it. Users which cannot be deleted or reassigned:</p>
+<table border="1">
+"@
+            If(-Not [string]::IsNullOrEmpty($EMAIL_DELETED_USERS_REPORT_ASSET_EOL_CUSTOMFIELD)) {
+                $body += "<tr><td>Username</td><td>Department (Last Sync)</td><td>Exists in AD</td><td>Non-EOL Assignments</td><td>Total Assignments</td></tr>"
+            } else {
+                $body += "<tr><td>Username</td><td>Department (Last Sync)</td><td>Exists in AD</td><td>Total Assignments</td></tr>"
+            }
             # Double-check whether the user still exists in AD at all.
             foreach($user in $inactive_users_undeletable) {
-                $adUser = $null
-                try {
-                    $id = $null
-                    if ($AD_SYNC_ON_EMPLOYEE_NUM -And -Not [string]::IsNullOrEmpty($user.employee_num) -And ($AD_GROUP_PROPERTY_MAP['employee_num'] -eq 'SID' -Or [string]::IsNullOrEmpty($AD_GROUP_PROPERTY_MAP['employee_num']))) {
-                        $id = $user.employee_num
-                        $prop = $AD_GROUP_PROPERTY_MAP['employee_num']
-                    } else {
-                        $prop = $AD_GROUP_PROPERTY_MAP['username']
-                        if (-Not $user.username.Contains('@')) {
-                            $id = $user.username
-                        }
-                    }
-                    if (-Not [string]::IsNullOrEmpty($id)) {
-                        $adUser = Get-ADUser $id -ErrorAction SilentlyContinue
-                    } else {
-                        $un = $user.username
-                        if (-Not [string]::IsNullOrEmpty($prop)) {
-                            $adUser = Get-ADUser -LDAPFilter "($prop=$un)" -ErrorAction SilentlyContinue | Select -First 1
-                        } else {
-                            $adUser = Get-ADUser -LDAPFilter "(|(UserPrincipalName=$un)(mail=$un))" -ErrorAction SilentlyContinue | Select -First 1
-                        }
-                    }
-                } catch {}
-                $existsInAD = ($adUser.Enabled -eq $true)
+                $existsInAD = $user._ExistsInAD
                 if (-Not $existsInAD) { $existsInAD = "<b>False</b>" }
                 $username = $user.username
                 if (-Not [string]::IsNullOrEmpty($spHostURL)) {
@@ -539,19 +596,32 @@ if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP)) {
                 }
                 # Just in case one of these counts do not resolve to an integer.
                 $total = $null
+                $totalNonEol = $null
                 try {
+                    if ($user.assets_count -gt 0 -And -Not [string]::IsNullOrEmpty($EMAIL_DELETED_USERS_REPORT_ASSET_EOL_CUSTOMFIELD)) {
+                        $totalNonEol = ($sp_assets | where {$_.assigned_to.id -eq $user.id -And ($_.custom_fields.$EMAIL_DELETED_USERS_REPORT_ASSET_EOL_CUSTOMFIELD.value -as [DateTime]) -gt (Get-Date)} | Measure-Object).Count
+                        # If greater than 0, bold the result.
+                        if (-Not [string]::IsNullOrEmpty($totalNonEol) -And $totalNonEol -gt 0) {
+                            $totalNonEol = '<b>{0}</b>' -f $totalNonEol
+                        }
+                    }
                     $total = $user.assets_count + $user.licenses_count + $user.consumables_count + $user.accessories_count
                 } catch {
                     Write-Error $_
                     $total = 'ERROR'
+                    $totalNonEol = 'ERROR'
                 }
                 # Add row for user.
-                $body += ('<tr><td>{0}</td><td>{1}</td><td style="text-align: center;">{2}</td><td style="text-align: center;">{3}</td></tr>' -f $username, $user.department.name, $existsInAD, $total)
+                If(-Not [string]::IsNullOrEmpty($EMAIL_DELETED_USERS_REPORT_ASSET_EOL_CUSTOMFIELD)) {
+                    $body += ('<tr><td>{0}</td><td>{1}</td><td style="text-align: center;">{2}</td><td style="text-align: center;">{3}</td><td style="text-align: center;">{4}</td></tr>' -f $username, $user.department.name, $existsInAD, $totalNonEol, $total)
+                } else {
+                    $body += ('<tr><td>{0}</td><td>{1}</td><td style="text-align: center;">{2}</td><td style="text-align: center;">{3}</td></tr>' -f $username, $user.department.name, $existsInAD, $total)
+                }
             }
             $body += @"
 </table>
 
-<p>A report has been saved to [<a href="file://$AD_SYNC_EXPORT_DELETED_USERS_PATH">$AD_SYNC_EXPORT_DELETED_USERS_PATH</a>].</p>
+<p>A report has been saved to [<a href="file://$AD_SYNC_DELETED_USERS_EXPORT_PATH">$AD_SYNC_DELETED_USERS_EXPORT_PATH</a>].</p>
 
 <p>This message generated on [$datestamp] from [Snipeit-AD-Sync.ps1] running on [${ENV:COMPUTERNAME}].</p>
 </body></html>
