@@ -209,9 +209,9 @@ function Get-ADUsersByGroup {
         
         if ($Nested) {
             # May not work with >5000 results
-            $ad_users += Get-ADGroupMember $group -Recursive -ErrorAction Stop
+            $ad_users += Get-ADGroupMember $group -Recursive -ErrorAction Stop | ?{$_.objectClass -eq 'user'}
         } else {
-            $ad_users += Get-ADGroup $group -Properties Member -ErrorAction Stop | Select -ExpandProperty Member
+            $ad_users += Get-ADGroup $group -Properties Member -ErrorAction Stop | ?{$_.objectClass -eq 'user'} | Select -ExpandProperty Member
         }
     }
     if ($ad_users -ne $null) {
