@@ -63,6 +63,7 @@ Use `get-help <Function> -Full` for more information about each function (e.g. `
 - `Format-SnipeItAsset` -- For formatting assets for output to file (IE, CSV).
 - `Format-SnipeItEntity` -- For formatting other snipe-it entities for output to file (IE, CSV).
 - `Remove-SnipeItInactiveEntity` -- Removing inactive/unassigned snipe-it objects other than users and assets (models, departments, etc.)
+- `Update-SnipeItInactiveUserReassignment` -- Reassigns assets from inactive users to departmental users, allowing the inactive user to be deleted from snipe-it.
 
 ## All Other Functions in `SnipeIt-Sync-PS.ps1`
 These functions are mainly used internally.
