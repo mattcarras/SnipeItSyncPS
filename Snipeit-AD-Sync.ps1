@@ -189,9 +189,9 @@ function Get-ADUsersByGroup {
         
         if ($Nested) {
             # May not work with >5000 results
-            $ad_users += Get-ADGroupMember $group -Recursive -ErrorAction Stop
+            $ad_users += Get-ADGroupMember $group -Recursive -ErrorAction Stop | ?{$_.objectClass -eq 'user'}
         } else {
-            $ad_users += Get-ADGroup $group -Properties Member -ErrorAction Stop | Select -ExpandProperty Member
+            $ad_users += Get-ADGroup $group -Properties Member -ErrorAction Stop | ?{$_.objectClass -eq 'user'} | Select -ExpandProperty Member
         }
     }
     # Get extra attributes for each user
@@ -345,7 +345,7 @@ $extraParams = @{}
 if ($AD_GROUP_PROPERTY_FILTER_MAP -is [hashtable]) {
     $extraParams.Add("ADPropertyFilterMap", $AD_GROUP_PROPERTY_FILTER_MAP)
 }
-$_props = ($AD_GROUP_PROPERTY_MAP.Values | where {$_ -ne "SID"})
+$props = ($AD_GROUP_PROPERTY_MAP.Values | where {$_ -ne "SID"})
 $ad_users = $AD_GROUP_TARGETS | foreach { 
     if($_.groupname -is [string]) { 
         if ($_.ldap_import -is [bool]) { 
@@ -360,7 +360,7 @@ $ad_users = $AD_GROUP_TARGETS | foreach {
             $groups = $_.groups 
         }
         
-        Get-ADUsersByGroup -TargetGroup $_.groupname -Nested:$_.nested -ADProperties $_props @extraParams -Verbose | Select *,@{N="_ldap_import"; Expression={ $ldap_import }},@{N="_activated"; Expression={ $activated }},@{N="_groups"; Expression={ $groups }}
+        Get-ADUsersByGroup -TargetGroup $_.groupname -Nested:$_.nested -ADProperties $props @extraParams -Verbose | Select *,@{N="_ldap_import"; Expression={ $ldap_import }},@{N="_activated"; Expression={ $activated }},@{N="_groups"; Expression={ $groups }}
     }
 } | Group-Object -Property distinguishedname | foreach {
     # Group the results by distinguishedname and merge into a new object
