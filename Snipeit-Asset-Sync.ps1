@@ -92,6 +92,8 @@ $LOGFILE_ROTATE_DAYS = 365
 $EXPORTS_PATH = "\\path\to\Snipe-It\Exports"
 $EXPORTS_PREFIX_FORMATTED = "assets_formatted"
 $EXPORTS_PREFIX_SNIPEIT = "assets_snipeit"
+# Define an explicit order for customfields in the exports (comes after the main fields).
+#$EXPORTS_CUSTOMFIELD_ORDER = @("CustomField1","CustomField2","CustomField3")
 $EXPORTS_ROTATE_DAYS = 365
 #>
 
@@ -247,6 +249,7 @@ function Get-ComputerFormFactorFromChassis {
     }
 }
 
+# Format asset to properties expected by Snipe-It.
 function Format-AssetForSyncing {
     <#
         .SYNOPSIS
@@ -260,9 +263,6 @@ function Format-AssetForSyncing {
         
         .PARAMETER PropertyMap
         A hashtable of "SnipeItAssetField"="AssetProperty".
-
-        .PARAMETER DateFormat
-        The string format for all dates. Defaults to 'yyyy-MM-dd', which is the format currently required by Snipe-It.
         
         .OUTPUTS
         The asset object(s) formatted for use with Sync-SnipeItAsset.
@@ -285,16 +285,14 @@ function Format-AssetForSyncing {
             "Model"="Model"
             "Manufacturer"="Manufacturer"
             "Category"="Type"
-        },
-        
-        [parameter(Mandatory=$false)]
-        [string]$DateFormat='yyyy-MM-dd'
+        }
     )
     Begin {
         # Compute the given Property Map into an array for Select-Object.
         $SelectArray = $PropertyMap.GetEnumerator() | where {-Not [string]::IsNullOrWhitespace($_.Value)} | foreach {
             $val = $_.Value
-            @{N=$_.Name; Expression=[Scriptblock]::Create("if (`$_.'$val' -is [DateTime]) { ([DateTime]`$_.'$val').ToString('$DateFormat') } else { `$_.'$val' }") }
+            # The format of 'yyyy-MM-dd' is required for compatibility with Snipe-It.
+            @{N=$_.Name; Expression=[Scriptblock]::Create("if (`$_.'$val' -is [DateTime]) { ([DateTime]`$_.'$val').ToString('yyyy-MM-dd') } else { `$_.'$val' }") }
         }
     }
     Process {
@@ -598,12 +596,35 @@ If ((Test-Path $IMPORT_CSV_PATH -PathType Leaf) -And -Not [string]::IsNullOrEmpt
     $sccm_assets = @()
 }
 if ($AD_IMPORT_SEARCHBASES.Count -gt 0) {
-    $ad_assets = Import-AssetsFromAD -SearchBase $AD_IMPORT_SEARCHBASES -Verbose | where {$_.Platform -eq "PC"}
+    $ad_assets = Import-AssetsFromAD -SearchBase $AD_IMPORT_SEARCHBASES -Verbose
+    # Export all joined assets
+    if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container) -And $EXPORTS_PREFIX_AD -is [string]) {
+        # Rotate previous exports
+        if ($EXPORTS_ROTATE_DAYS -is [int] -And $EXPORTS_ROTATE_DAYS -gt 0) {
+            Get-ChildItem "${EXPORTS_PATH}\${EXPORTS_PREFIX_AD}_*" | Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-$EXPORTS_ROTATE_DAYS) } | Remove-Item -Force
+        }
+        $fp = "${EXPORTS_PATH}\${EXPORTS_PREFIX_AD}_$(get-date -f yyyy-MM-dd).csv"
+        Write-Host("[{0}] Exporting assets from AD to CSV file [{1}]..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"), $fp)
+        $ad_assets | Export-CSV $fp -NoTypeInformation -Force
+    }
+    # Filter out only PC assets.
+    $ad_assets = $ad_assets | where {$_.Platform -eq "PC"}
 } else {
     $ad_assets = @()
 }
 # Join the results together.
 $joined_assets = Join-Assets -Left $sccm_assets -Right $ad_assets -On "SID" -Verbose
+
+# Export all joined assets
+if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container) -And $EXPORTS_PREFIX_SCCM_AD -is [string]) {
+    # Rotate previous exports
+    if ($EXPORTS_ROTATE_DAYS -is [int] -And $EXPORTS_ROTATE_DAYS -gt 0) {
+        Get-ChildItem "${EXPORTS_PATH}\${EXPORTS_PREFIX_SCCM_AD}_*" | Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-$EXPORTS_ROTATE_DAYS) } | Remove-Item -Force
+    }
+    $fp = "${EXPORTS_PATH}\${EXPORTS_PREFIX_SCCM_AD}_$(get-date -f yyyy-MM-dd).csv"
+    Write-Host("[{0}] Exporting assets from SCCM and AD to CSV file [{1}]..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"), $fp)
+    $joined_assets | Export-CSV $fp -NoTypeInformation -Force
+}
 
 # Example of how to get results directly from SCCI using a WMI query.
 # Fields with WMI Timestamps will need to be converted into DateTime like so: 
@@ -622,7 +643,6 @@ If ($ASSET_FIELD_MAP.ContainsKey("location") -Or $ASSET_FIELD_MAP.ContainsKey("l
 If ($ASSET_FIELD_MAP.ContainsKey("supplier") -Or $ASSET_FIELD_MAP.ContainsKey("supplier_id")) {
     $cacheentities += @("suppliers")
 }
-
 $extraParams = @{}
 If ($DEBUG_HALT_ON_NULL_CACHE) {
     $extraParams.Add("ErrorOnNullEntities", $cacheentities)
@@ -630,27 +650,19 @@ If ($DEBUG_HALT_ON_NULL_CACHE) {
 Initialize-SnipeItCache -EntityTypes $cacheentities -Verbose @extraParams
 
 # Filter out those that don't exist in SCCM and VMs, and format for syncing
+# Note date format is hardcoded as yyyy-MM-dd to ensure compatibility with snipe-it, which should reformat the date as needed.
 $formatted_assets = $joined_assets | where {$_."Exists in SCCM" -eq $true -And -Not $_.IsVirtualMachine} | Format-AssetForSyncing -PropertyMap $ASSET_FIELD_MAP
 
 # Export all formatted assets
-if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container)) {
-    # Rotate exports
-    if ($EXPORTS_ROTATE_DAYS -is [int] -And $EXPORTS_ROTATE_DAYS -gt 0) {
-        Get-ChildItem "${EXPORTS_PATH}\*" -File | Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-$EXPORTS_ROTATE_DAYS) } | Remove-Item -Force
-    }
-    if ($EXPORTS_PREFIX_FORMATTED -is [string]) {
-        $fp = "${EXPORTS_PATH}\${EXPORTS_PREFIX_FORMATTED}.csv"
-        if (Test-Path $fp -PathType Leaf) {
-            Remove-Item $fp -Force
-        }
-        Write-Host("[{0}] Exporting formatted assets to CSV file [{1}]..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"), $fp)
-        $formatted_assets | Export-CSV -NoTypeInformation -Force $fp
-    }
+if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container) -And $EXPORTS_PREFIX_FORMATTED -is [string]) {
+    $fp = "${EXPORTS_PATH}\${EXPORTS_PREFIX_FORMATTED}.csv"
+    Write-Host("[{0}] Exporting formatted copy of assets to be processed to CSV file [{1}]..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"), $fp)
+    $formatted_assets | Export-CSV $fp -NoTypeInformation -Force
 }
-
+    
 $error_count = 0
-if (-Not $ENABLE_SYNC) {
-    Write-Host('Please set $ENABLE_SYNC to $true when ready to start syncing.')
+if ($ENABLE_SYNC -ne $true) {
+    Write-Host('[{0}] Skipping sync, please set $ENABLE_SYNC=$true to start syncing' -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"))
     Write-Debug('Debug breakpoint due to $ENABLE_SYNC not set.')
 } else {
     Write-Host("[{0}] Starting sync..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"))
@@ -658,8 +670,8 @@ if (-Not $ENABLE_SYNC) {
     if (-Not [string]::IsNullOrWhitespace($ASSET_DEFAULT_MODEL)) {
         $extraParams.Add("DefaultModel", $ASSET_DEFAULT_MODEL)
     }
-    if (-Not [string]::IsNullOrWhitespace($ASSET_ARCHIVED_STATUS_UPDATE)) {
-        $extraParams.Add('UpdateArchivedStatus', $ASSET_ARCHIVED_STATUS_UPDATE)
+    if (-Not [string]::IsNullOrWhitespace($ASSET_STATUS_ARCHIVED_UPDATE)) {
+        $extraParams.Add('UpdateArchivedStatus', $ASSET_STATUS_ARCHIVED_UPDATE)
     }
     if (-Not [string]::IsNullOrWhitespace($ASSET_STATUS_ASSIGNED)) {
         $extraParams.Add('DefaultAssignedStatus', $ASSET_STATUS_ASSIGNED)
@@ -680,26 +692,41 @@ if (-Not $ENABLE_SYNC) {
 if ($EXPORTS_PATH -is [string] -And (Test-Path $EXPORTS_PATH -PathType Container)) {
     Write-Host("[{0}] Preparing to export assets from snipe-it..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"))
     try {  
-        $sp_assets = (Get-SnipeItEntityAll "assets").Values | foreach { $_ } | Format-SnipeItAsset -AddDepartment
+        $sp_assets = Get-SnipeItEntityAll "assets" -ReturnValues | Format-SnipeItAsset -AddDepartment -AddDepartmentId -Verbose
         # Ensure we have all possible custom fields in output
         # initial_props are always ordered first, the other columns are semi-sorted
-        # TODO: Gotta be a faster way of doing this.
         $initial_props = @('asset_tag','name','serial','status_label','assigned_to','Department','manufacturer','model','category')
         $props = $sp_assets | % { Get-Member -MemberType NoteProperty -InputObject $_ | Select -ExpandProperty Name } | Select -Unique | where {$_ -notin $initial_props}
+        if ($props -is [string]) {
+            $props = @($props)
+        }
         if ($props -is [array]) {
-            $props = $initial_props + $props
-        } elseif ($props -is [string]) {
-            $props = $initial_props + @($props)
+            if($EXPORTS_CUSTOMFIELD_ORDER -is [array]) {
+                # Rearrange custom field columns, if they exist
+                foreach($customfield in $EXPORTS_CUSTOMFIELD_ORDER) {
+                    if ($customfield -in $props) {
+                        $initial_props += @($customfield)
+                    }
+                }
+            }
+            $props = $initial_props + ($props | where {$_ -notin $initial_props})
         } else {
             # Should never get here
             $props = $initial_props
         }
-        $sp_assets = $sp_assets | Select $props
-    
+        $sp_assets = $sp_assets | Select $props | Sort -Property 'Department'
+
+        # Export all assets.
         if ($EXPORTS_PREFIX_SNIPEIT -is [string]) {
             $fp = "${EXPORTS_PATH}\${EXPORTS_PREFIX_SNIPEIT}_$(get-date -f yyyy-MM-dd).csv"
-            Write-Host("[{0}] Exporting assets from snipe-it to CSV file [{1}]..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"), $fp)            
-            $sp_assets | Export-CSV -NoTypeInformation -Force $fp
+            Write-Host("[{0}] Exporting assets from snipe-it to CSV file [{1}]..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"), $fp)
+            # Rotate previous exports
+            if ($EXPORTS_ROTATE_DAYS -is [int] -And $EXPORTS_ROTATE_DAYS -gt 0) {
+                Get-ChildItem "${EXPORTS_PATH}\${EXPORTS_PREFIX_SNIPEIT}_*.csv" | Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-$EXPORTS_ROTATE_DAYS) } | Remove-Item -Force
+            }
+            $sp_assets | Export-CSV $fp -NoTypeInformation -Force
+            Write-Host("[{0}] Making a copy of latest export from snipe-it to CSV file [{1}]..." -f (Get-Date).toString("yyyy/MM/dd HH:mm:ss"), "${EXPORTS_PATH}\${EXPORTS_PREFIX_SNIPEIT_LATEST}.csv")
+            Copy-Item $fp "${EXPORTS_PATH}\${EXPORTS_PREFIX_SNIPEIT_LATEST}.csv" -Force
         }
     } catch {
         Write-Error $_
