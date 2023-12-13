@@ -488,7 +488,7 @@ Write-Host("[{0}] Caught {1} errors" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:s
 if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP)) {    
     # Email out a report on deleted users.
     if ($EMAIL_DELETED_USERS_REPORT -Or $EmailDeletedUsersReport) {
-        if (-Not [string]::IsNullOrEmpty($inactive_users_undeletable) -And $inactive_users -ne $null -And -Not [string]::IsNullOrWhiteSpace($EMAIL_DELETED_USERS_REPORT_FROM) -And -Not [string]::IsNullOrEmpty($emailDeletedUsersReportTo) -And -Not [string]::IsNullOrEmpty($EMAIL_DELETED_USERS_REPORT_SUBJECT)) {
+        if (-Not [string]::IsNullOrEmpty($inactive_users_undeletable) -And $inactive_users -ne $null -And -Not [string]::IsNullOrWhiteSpace($EMAIL_DELETED_USERS_REPORT_FROM) -And -Not [string]::IsNullOrEmpty($EMAIL_DELETED_USERS_REPORT_TO) -And -Not [string]::IsNullOrEmpty($EMAIL_DELETED_USERS_REPORT_SUBJECT)) {
             $total_count = $inactive_users.Count
             $datestamp = (Get-Date).toString("yyyy/MM/dd HH:mm:ss")
             if (($AD_SYNC_DELETED_USERS_PURGE -Or $ADSyncDeletedUsersPurge) -And -Not $AD_SYNC_DELETED_USERS_REPORT_ONLY) {
@@ -556,8 +556,8 @@ if (-Not [string]::IsNullOrWhiteSpace($EMAIL_SMTP)) {
 <p>This message generated on [$datestamp] from [Snipeit-AD-Sync.ps1] running on [${ENV:COMPUTERNAME}].</p>
 </body></html>
 "@
-            Send-MailMessage -From $EMAIL_DELETED_USERS_REPORT_FROM -To $emailDeletedUsersReportTo -Subject $EMAIL_DELETED_USERS_REPORT_SUBJECT -Body $body -Priority High -DeliveryNotificationOption OnSuccess, OnFailure -SmtpServer $EMAIL_SMTP -BodyAsHtml
-            Write-Host("[{0}] Emailed inactive user report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($emailDeletedUsersReportTo -join ", "))
+            Send-MailMessage -From $EMAIL_DELETED_USERS_REPORT_FROM -To $EMAIL_DELETED_USERS_REPORT_TO -Subject $EMAIL_DELETED_USERS_REPORT_SUBJECT -Body $body -Priority High -DeliveryNotificationOption OnSuccess, OnFailure -SmtpServer $EMAIL_SMTP -BodyAsHtml
+            Write-Host("[{0}] Emailed inactive user report to [{1}]" -f ((Get-Date).toString("yyyy/MM/dd HH:mm:ss")), ($EMAIL_DELETED_USERS_REPORT_TO -join ", "))
         }
     }
 
