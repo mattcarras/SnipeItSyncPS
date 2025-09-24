@@ -38,11 +38,6 @@ Loads settings from `SnipeIt-Import-Assets-Settings.ps1`. This file must be setu
 
 Loads settings from `SnipeIt-Asset-Sync-Settings.ps1` and `SnipeIt-Disable-DeletedUser-Systems-Settings.ps1` in that order. Both files must be setup first.
 
-### SnipeIt-Cleanup.ps1
-`SnipeIt-Cleanup.ps1` helps cleanup unassigned snipe-it entities (locations, models, companies, etc.).
-
-Loads settings from `SnipeIt-Cleanup-Settings.ps1`.
-
 ## Design
 ### Working off Cache
 The functions are designed to work off cache as much as possible to minimize REST API calls. The maximum age of the cache can be set when calling `Initialize-SnipeItCache` for multiple entities, or `Get-SnipeItEntityAll` for a single one. Default is 120 minutes.
