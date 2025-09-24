@@ -14,18 +14,34 @@ You must set `$CREDXML_PATH='\path\to\your\creds.xml'` at the top of each of the
 
 `Connect-SnipeIt` will connect to your Snipe-It instance using the given credentials. This function also setups the cache. It optionally supports a `-IgnoreSelfSignedCert` parameter for instances using self-signed certificates.
 
-**At minimum, to start each script syncing it requires setting at the top of the file:**
+**At minimum, to start each script syncing it requires setting at the top of the settings file:**
 - A valid `$CREDXML_PATH`.
 - `$ENABLE_SYNC=$true`
 
 ### SnipeIt-AD-Sync.ps1
 The `SnipeIt-AD-Sync.ps1` script syncs AD users with snipe-it. It should work with minimal setup required.
 
+Loads settings from `SnipeIt-AD-Sync-Settings.ps1`.
+
 ### SnipeIt-Asset-Sync.ps1
 `SnipeIt-Asset-Sync.ps1` must be tailored to each environment. It was tested with SCCM reports exported to a fileshare as described [here](https://docs.microsoft.com/en-us/mem/configmgr/core/servers/manage/operations-and-maintenance-for-reporting#bkmk_subscription), but you could also do a WQL query direct against the SCCM server (an example is given in `SnipeIt-Asset-Sync.ps1`), or query computers by WMI directly (using `Import-AssetFromWMI` found in the same script).
 
+Loads settings from `SnipeIt-Asset-Sync-Settings.ps1`. This file must be setup first.
+
 ### SnipeIt-Import-Assets.ps1
 `SnipeIt-Import-Assets.ps1` syncs information from a given CSV file. Results will be emailed to the file's creator/owner by default. This allows more fine-tuned control over importing assets. By editing the script one can possibly set criteria required for editing certain fields or assets. In a future release the script will have built-in support for restricting access based on group membership.
+
+Loads settings from `SnipeIt-Import-Assets-Settings.ps1`. This file must be setup first.
+
+### SnipeIt-Disable-DeletedUser-Systems.ps1
+`SnipeIt-Disable-DeletedUser-Systems.ps1` disables AD systems assigned to users deleted from Snipe-It that match specified criteria, intended to be used with the `Update-SnipeItInactiveUserReassignment` function called from `SnipeIt-AD-Sync.ps1`.
+
+Loads settings from `SnipeIt-Asset-Sync-Settings.ps1` and `SnipeIt-Disable-DeletedUser-Systems-Settings.ps1` in that order. Both files must be setup first.
+
+### SnipeIt-Cleanup.ps1
+`SnipeIt-Cleanup.ps1` helps cleanup unassigned snipe-it entities (locations, models, companies, etc.).
+
+Loads settings from `SnipeIt-Cleanup-Settings.ps1`.
 
 ## Design
 ### Working off Cache
